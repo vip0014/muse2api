@@ -1,0 +1,14 @@
+.git
+.env
+.runtime-test
+data
+bin
+web/node_modules
+web/dist
+web/tsconfig.tsbuildinfo
+**/*.test.ts
+**/*.test.tsx
+docs
+deploy
+backups
+*.md

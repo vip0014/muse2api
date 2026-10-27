@@ -1,0 +1,8 @@
+# Optional resource ceiling for a Linux host. Chromium, not the Go control
+# plane, dominates memory; adjust after observing the real workload.
+#
+#   docker compose -f docker-compose.yml -f deploy/docker-compose.resources.yml up -d
+services:
+  muse2api:
+    mem_limit: 4g
+    cpus: "2.0"

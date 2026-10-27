@@ -1,0 +1,15 @@
+.env
+/backups/
+/deploy/secrets/*
+!/deploy/secrets/.gitignore
+/data/*
+!/data/.gitkeep
+!/data/accounts.example.json
+/bin/
+/web/node_modules/
+/web/dist/
+/web/tsconfig.tsbuildinfo
+/internal/server/static/*
+!/internal/server/static/index.html
+*.log
+coverage.out

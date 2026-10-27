@@ -1,0 +1,79 @@
+services:
+  muse2api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: muse2api:2.0.0
+    container_name: muse2api
+    # tini reaps Chromium child processes and forwards signals cleanly.
+    init: true
+    restart: unless-stopped
+    # The app bounds HTTP shutdown (20s), task shutdown (10s) and driver close
+    # (3s); keep headroom above that total.
+    stop_grace_period: 50s
+    # Override only when the host data directory is owned by another UID/GID.
+    user: "${MUSE2API_UID:-10001}:${MUSE2API_GID:-10001}"
+    ports:
+      - "${MUSE2API_BIND:-127.0.0.1}:18610:18610"
+    environment:
+      # Secrets: *_FILE wins over the direct value. Use Docker secrets with
+      # deploy/docker-compose.secrets.yml in production.
+      MUSE2API_KEY: "${MUSE2API_KEY:-}"
+      MUSE2API_KEY_FILE: "${MUSE2API_KEY_FILE:-}"
+      MUSE2API_ADMIN_USERNAME: "${MUSE2API_ADMIN_USERNAME:-admin}"
+      MUSE2API_ADMIN_PASSWORD: "${MUSE2API_ADMIN_PASSWORD:-}"
+      MUSE2API_ADMIN_PASSWORD_FILE: "${MUSE2API_ADMIN_PASSWORD_FILE:-}"
+      MUSE2API_CREDENTIAL_KEY: "${MUSE2API_CREDENTIAL_KEY:-}"
+      MUSE2API_CREDENTIAL_KEY_FILE: "${MUSE2API_CREDENTIAL_KEY_FILE:-}"
+      MUSE2API_PROXY: "${MUSE2API_PROXY:-}"
+      MUSE2API_PROXY_FILE: "${MUSE2API_PROXY_FILE:-}"
+      MUSE2API_SESSION_TTL: "${MUSE2API_SESSION_TTL:-43200}"
+      MUSE2API_TRUST_PROXY: "${MUSE2API_TRUST_PROXY:-0}"
+      MUSE2API_KEEP_LEGACY_PLAINTEXT: "${MUSE2API_KEEP_LEGACY_PLAINTEXT:-0}"
+      MUSE2API_ALLOW_INSECURE_CREDENTIALS: "${MUSE2API_ALLOW_INSECURE_CREDENTIALS:-0}"
+      MUSE2API_HOST: 0.0.0.0
+      MUSE2API_PORT: 18610
+      MUSE2API_PUBLIC_BASE: "${MUSE2API_PUBLIC_BASE:-}"
+      MUSE2API_SITE: "${MUSE2API_SITE:-https://muse.ai}"
+      MUSE2API_CONCURRENCY: "${MUSE2API_CONCURRENCY:-2}"
+      MUSE2API_QUEUE_SIZE: "${MUSE2API_QUEUE_SIZE:-64}"
+      MUSE2API_IMAGE_TIMEOUT: "${MUSE2API_IMAGE_TIMEOUT:-240}"
+      MUSE2API_VIDEO_TIMEOUT: "${MUSE2API_VIDEO_TIMEOUT:-600}"
+      MUSE2API_CHAT_TIMEOUT: "${MUSE2API_CHAT_TIMEOUT:-300}"
+      MUSE2API_HTTP_TIMEOUT: "${MUSE2API_HTTP_TIMEOUT:-20}"
+      MUSE2API_MAX_UPLOAD_BYTES: "${MUSE2API_MAX_UPLOAD_BYTES:-16777216}"
+      MUSE2API_MAX_MEDIA_BYTES: "${MUSE2API_MAX_MEDIA_BYTES:-536870912}"
+      MUSE2API_BROWSER: "${MUSE2API_BROWSER:-1}"
+      MUSE2API_CHROMIUM: /usr/bin/chromium
+      MUSE2API_CDP_PORT: "${MUSE2API_CDP_PORT:-19210}"
+      MUSE2API_LOGIN_WAIT: "${MUSE2API_LOGIN_WAIT:-60}"
+      MUSE2API_PROFILE_ROOT: "${MUSE2API_PROFILE_ROOT:-}"
+      MUSE2API_PROFILE_DIR: "${MUSE2API_PROFILE_DIR:-}"
+      MUSE2API_DOWNLOAD_DIR: "${MUSE2API_DOWNLOAD_DIR:-}"
+      MUSE2API_CORS_ORIGINS: "${MUSE2API_CORS_ORIGINS:-}"
+      MUSE2API_PUBLIC_MEDIA: "${MUSE2API_PUBLIC_MEDIA:-0}"
+      MUSE2API_LOG_LEVEL: "${MUSE2API_LOG_LEVEL:-info}"
+      MUSE2API_KEEPALIVE_DISABLED_ACCOUNTS: "${MUSE2API_KEEPALIVE_DISABLED_ACCOUNTS:-0}"
+      TZ: "${TZ:-Asia/Shanghai}"
+    volumes:
+      - ./data:/app/data
+    read_only: true
+    tmpfs:
+      # Chromium/crashpad and video decoding use temp files; keep the mount
+      # bounded but large enough for concurrent page/media work.
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # Chromium keeps many sockets/pipes open per page.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+        compress: "true"

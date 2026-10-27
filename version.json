@@ -1,0 +1,13 @@
+{
+  "version": "2.0.0",
+  "updated_at": "2026-10-26",
+  "upstream_baseline": "e2b8936bded94a51fe4d915ed4f831f9493e6e5a",
+  "highlights": [
+    "Go 原生 HTTP 服务与 AES-GCM 账号凭据存储",
+    "React + TypeScript 白色运维控制台",
+    "单管理员用户名/密码登录，管理会话与 OpenAI API Key 分离",
+    "有界持久任务队列、旧数据迁移和 OpenAI 兼容路由",
+    "不含 Python 或 Node.js 运行时；生成能力通过 Chromium/CDP 执行",
+    "2026-10-26 真实 Free 账号完成 Chat/SSE、Responses、图片、视频、额度和媒体验收"
+  ]
+}

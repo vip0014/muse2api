@@ -1,0 +1,513 @@
+package browser
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"mime"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+	"time"
+
+	"muse2api/internal/muse/protocol"
+)
+
+type attachment struct {
+	TID      string `json:"tid"`
+	HasVideo bool   `json:"hasVideo"`
+	HasImage bool   `json:"hasImg"`
+	Src      string `json:"src"`
+	VSrc     string `json:"vSrc"`
+	ISrc     string `json:"iSrc"`
+	Width    int    `json:"w"`
+	Height   int    `json:"h"`
+}
+
+const attachmentsJS = `(function(){
+	var list=[];var seen=new Set();
+	function addEl(el,tid){
+		if(!el||seen.has(el))return;seen.add(el);
+		if(el.closest('form, [class*=chat-user-bubble], [class*="group/msg"]'))return;
+		var v=el.querySelector('video')||(el.tagName==='VIDEO'?el:null);
+		var img=el.querySelector('img')||(el.tagName==='IMG'?el:null);
+		var isVid=(tid||'').includes('video')||!!v;var primary=isVid?(v||img):(img||v);
+		var src=primary?(primary.currentSrc||primary.src||''):'';
+		if(src&&!seen.has(src)){seen.add(src);list.push({tid:tid||el.getAttribute('data-testid')||(isVid?'video':'image'),hasVideo:!!v,hasImg:!!img,src:src,vSrc:v?(v.currentSrc||v.src||''):'',iSrc:img?(img.currentSrc||img.src||''):'',w:primary?(primary.videoWidth||primary.naturalWidth||0):0,h:primary?(primary.videoHeight||primary.naturalHeight||0):0});}
+	}
+	document.querySelectorAll('[data-testid^="hatch-chat-attachment-presentation-"]').forEach(function(a){addEl(a,a.getAttribute('data-testid'));});
+	document.querySelectorAll('div[class*="hatch-agent-bubble-bg"] img, div[class*="hatch-agent-bubble-bg"] video').forEach(function(m){var s=m.currentSrc||m.src||'';if(s&&!s.includes('avatar')&&!s.includes('emoji'))addEl(m.parentElement||m,'agent-media');});
+	return JSON.stringify(list);
+})()`
+
+const scrollBottomJS = `(function(){var els=[...document.querySelectorAll('*')].filter(function(e){var s=getComputedStyle(e);return(s.overflowY==='auto'||s.overflowY==='scroll')&&e.scrollHeight>e.clientHeight+100;});els.sort(function(a,b){return b.scrollHeight-a.scrollHeight;});if(els[0])els[0].scrollTop=els[0].scrollHeight;var s=document.scrollingElement||document.body;s.scrollTop=s.scrollHeight;var el=document.querySelector('textarea');if(el)el.scrollIntoView({block:'end'});return 1;})()`
+
+func (p *Page) attachments(ctx context.Context) ([]attachment, error) {
+	var raw string
+	if err := p.conn.JS(ctx, attachmentsJS, false, &raw); err != nil {
+		return nil, err
+	}
+	var out []attachment
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (p *Page) clearAttachments(ctx context.Context) {
+	_ = p.conn.JS(ctx, `(function(){var btns=Array.from(document.querySelectorAll('button[aria-label]')).filter(function(b){var al=b.getAttribute('aria-label')||'';return /remove\s*attachment|移除附件|删除附件|移除|删除/i.test(al);});btns.forEach(function(b){b.click();});Array.from(document.querySelectorAll('input[type="file"]')).forEach(function(inp){inp.value='';});return btns.length;})()`, false, nil)
+	time.Sleep(300 * time.Millisecond)
+}
+
+func normalizeReference(ctx context.Context, raw string) ([]byte, string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, "", nil
+	}
+	if len(raw) > (16<<20)*4/3+1024 {
+		return nil, "", errors.New("参考图超过 16 MiB")
+	}
+	if strings.HasPrefix(raw, "data:") {
+		parts := strings.SplitN(raw, ",", 2)
+		if len(parts) != 2 {
+			return nil, "", errors.New("参考图 data URL 无效")
+		}
+		mimeType := "image/png"
+		if semicolon := strings.IndexByte(parts[0], ';'); semicolon >= 0 {
+			mimeType = strings.TrimPrefix(parts[0][:semicolon], "data:")
+		}
+		data, err := base64.StdEncoding.DecodeString(parts[1])
+		return data, mimeType, err
+	}
+	if strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://") {
+		return fetchReference(ctx, raw)
+	}
+	data, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil {
+		return nil, "", errors.New("参考图必须为 data URL、base64 或 http(s) URL")
+	}
+	if len(data) > 16<<20 {
+		return nil, "", errors.New("参考图超过 16 MiB")
+	}
+	return data, "image/png", nil
+}
+
+func fetchReference(ctx context.Context, raw string) ([]byte, string, error) {
+	u, err := url.Parse(raw)
+	if err != nil || u.User != nil {
+		return nil, "", errors.New("参考图 URL 无效")
+	}
+	transport := &http.Transport{Proxy: nil}
+	defer transport.CloseIdleConnections()
+	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(address)
+		if err != nil {
+			return nil, err
+		}
+		ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+		if err != nil {
+			return nil, err
+		}
+		var chosen net.IP
+		for _, ip := range ips {
+			if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast() {
+				return nil, errors.New("参考图 URL 指向受限制网络")
+			}
+			if chosen == nil {
+				chosen = ip
+			}
+		}
+		if chosen == nil {
+			return nil, errors.New("参考图 URL 无法解析")
+		}
+		// Dial the IP that was just validated to avoid DNS rebinding between check and dial.
+		return (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, network, net.JoinHostPort(chosen.String(), port))
+	}
+	client := &http.Client{Transport: transport, Timeout: 20 * time.Second}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, "", err
+	}
+	req.Header.Set("User-Agent", "Muse2API-Go/2.0")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, "", errors.New("参考图下载失败")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, "", fmt.Errorf("参考图下载 HTTP %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, (16<<20)+1))
+	if err != nil || len(data) > 16<<20 {
+		return nil, "", errors.New("参考图超过 16 MiB")
+	}
+	mimeType := resp.Header.Get("Content-Type")
+	if mediaType, _, err := mime.ParseMediaType(mimeType); err == nil {
+		mimeType = mediaType
+	}
+	if !strings.HasPrefix(mimeType, "image/") {
+		return nil, "", errors.New("远程参考内容不是图片")
+	}
+	return data, mimeType, nil
+}
+
+func (p *Page) attachImage(ctx context.Context, raw string) error {
+	data, mimeType, err := normalizeReference(ctx, raw)
+	if err != nil || len(data) == 0 {
+		return errors.New("参考图读取失败，已停止生成")
+	}
+	if !strings.HasPrefix(mimeType, "image/") {
+		return errors.New("参考文件不是图片")
+	}
+	p.clearAttachments(ctx)
+	encoded := base64.StdEncoding.EncodeToString(data)
+	expression := `(function(b64,mime){try{var chars=atob(b64);var nums=new Array(chars.length);for(var i=0;i<chars.length;i++)nums[i]=chars.charCodeAt(i);var blob=new Blob([new Uint8Array(nums)],{type:mime});var ext=mime.split('/')[1]||'png';if(ext==='jpeg')ext='jpg';var file=new File([blob],'reference_image.'+ext,{type:mime});var inputs=Array.from(document.querySelectorAll('input[type="file"]'));if(!inputs.length)return JSON.stringify({ok:false,err:'no-file-input'});var ov=document.querySelector('[data-testid="hatch-composer-placeholder-overlay"]');var composer=ov?ov.closest('form'):null;var input=composer?inputs.find(function(x){return composer.contains(x);}):null;if(!input)input=inputs.find(function(x){return !x.closest('[class*=chat-user-bubble], [class*="group/msg"]');})||inputs[0];if(!input.getAttribute('accept'))input.setAttribute('accept','image/*');var dt=new DataTransfer();dt.items.add(file);input.files=dt.files;input.dispatchEvent(new Event('change',{bubbles:true}));input.dispatchEvent(new Event('input',{bubbles:true}));return JSON.stringify({ok:true});}catch(e){return JSON.stringify({ok:false,err:String(e)});}})(` + jsString(encoded) + `,` + jsString(mimeType) + `)`
+	var rawResult string
+	if err := p.conn.JS(ctx, expression, false, &rawResult); err != nil {
+		return err
+	}
+	var result struct {
+		OK bool `json:"ok"`
+	}
+	if err := json.Unmarshal([]byte(rawResult), &result); err != nil || !result.OK {
+		return errors.New("附加参考图失败，已停止生成")
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		var attached string
+		if err := p.conn.JS(ctx, `(function(){var btns=Array.from(document.querySelectorAll('button[aria-label]'));if(btns.some(function(b){return /remove\s*attachment|移除附件|删除附件/i.test(b.getAttribute('aria-label')||'');}))return 'remove';var ov=document.querySelector('[data-testid="hatch-composer-placeholder-overlay"]');var composer=ov?(ov.closest('form')||ov.parentElement.parentElement.parentElement):null;if(composer&&composer.querySelectorAll('img,video').length>0)return 'thumb';return '';})()`, false, &attached); err == nil && attached != "" {
+			time.Sleep(500 * time.Millisecond)
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(300 * time.Millisecond):
+		}
+	}
+	return errors.New("参考图上传未确认，已停止生成")
+}
+
+func mediaSource(a attachment, expect string) string {
+	if expect == "video" && a.VSrc != "" {
+		return a.VSrc
+	}
+	return a.Src
+}
+
+func matchingAttachment(a attachment, expect string) bool {
+	src := strings.ToLower(a.Src)
+	if expect == "video" {
+		return a.HasVideo || a.VSrc != "" || strings.HasSuffix(src, ".mp4") || strings.HasSuffix(src, ".webm") || strings.HasSuffix(src, ".mov")
+	}
+	return strings.Contains(strings.ToLower(a.TID), "image") || (!a.HasVideo && !strings.HasSuffix(src, ".mp4") && !strings.HasSuffix(src, ".webm") && !strings.HasSuffix(src, ".mov"))
+}
+
+var mediaReportPattern = regexp.MustCompile(`(?i)\.(webp|png|jpe?g|mp4|webm)|imagine_media|deliverable|generated\s+.*image|verified\s+generated|artifact`)
+var deliveryErrorPattern = regexp.MustCompile(`(?i)额度不足|积分不足|out of credits|达到上限|token limit`)
+var stuckDeliveryPattern = regexp.MustCompile(`(?i)Still sending|Delivery not confirmed|正在发送|未确认送达`)
+
+func (p *Page) waitAttachment(ctx context.Context, baseline map[string]bool, baseAgent, baseAttachments int, expect string) (*attachment, error) {
+	stableSrc := ""
+	stableCount := 0
+	lastText := ""
+	textStable := 0
+	started := time.Now()
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		time.Sleep(600 * time.Millisecond)
+		_ = p.conn.JS(ctx, scrollBottomJS, false, nil)
+		attachments, err := p.attachments(ctx)
+		if err != nil {
+			continue
+		}
+		matching := make([]attachment, 0, len(attachments))
+		for _, item := range attachments {
+			if matchingAttachment(item, expect) {
+				matching = append(matching, item)
+			}
+		}
+		if len(matching) > 0 {
+			candidate := matching[len(matching)-1]
+			source := mediaSource(candidate, expect)
+			if expect == "video" && candidate.VSrc == "" {
+				lower := strings.ToLower(source)
+				if !strings.HasSuffix(lower, ".mp4") && !strings.HasSuffix(lower, ".webm") && !strings.HasSuffix(lower, ".mov") {
+					source = ""
+				}
+			}
+			if source != "" && !baseline[source] {
+				if candidate.Width > 0 && candidate.Height > 0 {
+					return &candidate, nil
+				}
+				if source == stableSrc {
+					stableCount++
+				} else {
+					stableSrc, stableCount = source, 0
+				}
+				if stableCount >= 1 {
+					return &candidate, nil
+				}
+			}
+		}
+		state, err := p.chatState(ctx)
+		if err == nil {
+			var tail string
+			_ = p.conn.JS(ctx, `document.body ? document.body.innerText.slice(-700) : ''`, false, &tail)
+			if deliveryErrorPattern.MatchString(tail) {
+				return nil, errors.New("账号额度不足")
+			}
+			if time.Since(started) > 30*time.Second && state.Count == baseAgent && stuckDeliveryPattern.MatchString(tail) {
+				return nil, errors.New("提示词未成功送达后端，终止等待")
+			}
+			if state.Count > baseAgent && state.Text != "" && !state.Stop && len(attachments) <= baseAttachments && !mediaReportPattern.MatchString(state.Text) {
+				if state.Text == lastText {
+					textStable++
+				} else {
+					lastText, textStable = state.Text, 0
+				}
+				if textStable >= 15 && time.Since(started) > 8*time.Second {
+					return nil, errors.New("模型未生成媒体，仅返回文本")
+				}
+			} else {
+				textStable = 0
+			}
+		}
+	}
+}
+
+func (p *Page) extractBytes(ctx context.Context, src string) ([]byte, string, string, error) {
+	expression := `(async function(src,max){try{if(!src)return JSON.stringify({ok:false,err:'no-media-src'});var r=await fetch(src);if(!r.ok)return JSON.stringify({ok:false,err:'media-http-'+r.status});var b=await r.blob();if(b.size>max)return JSON.stringify({ok:false,err:'media-too-large'});var ab=await b.arrayBuffer();var bytes=new Uint8Array(ab);var s='';for(var i=0;i<bytes.length;i+=65536)s+=String.fromCharCode.apply(null,bytes.subarray(i,i+65536));return JSON.stringify({ok:true,mime:b.type||'',size:b.size,url:src,b64:btoa(s)});}catch(e){return JSON.stringify({ok:false,err:String(e)});}})(` + jsString(src) + `,` + fmt.Sprintf("%d", p.engine.cfg.MaxMediaBytes) + `)`
+	var lastErr error
+	for attempt := 0; attempt < 4; attempt++ {
+		var raw string
+		if err := p.conn.JS(ctx, expression, true, &raw); err != nil {
+			lastErr = err
+		} else {
+			var result struct {
+				OK   bool   `json:"ok"`
+				MIME string `json:"mime"`
+				URL  string `json:"url"`
+				B64  string `json:"b64"`
+				Err  string `json:"err"`
+			}
+			if err := json.Unmarshal([]byte(raw), &result); err == nil && result.OK {
+				data, err := base64.StdEncoding.DecodeString(result.B64)
+				if err == nil && len(data) > 0 && int64(len(data)) <= p.engine.cfg.MaxMediaBytes {
+					return data, result.MIME, result.URL, nil
+				}
+				lastErr = errors.New("媒体字节为空或超过限制")
+			} else {
+				lastErr = errors.New("页面媒体提取失败")
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return nil, "", "", ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+	}
+	return nil, "", "", lastErr
+}
+
+func randomMediaName(ext string) (string, error) {
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf) + ext, nil
+}
+
+func detectMediaType(data []byte) (kind, mimeType, ext string) {
+	switch {
+	case len(data) >= 8 && bytes.Equal(data[:8], []byte("\x89PNG\r\n\x1a\n")):
+		return "image", "image/png", ".png"
+	case len(data) >= 3 && data[0] == 0xff && data[1] == 0xd8 && data[2] == 0xff:
+		return "image", "image/jpeg", ".jpg"
+	case len(data) >= 6 && (bytes.Equal(data[:6], []byte("GIF87a")) || bytes.Equal(data[:6], []byte("GIF89a"))):
+		return "image", "image/gif", ".gif"
+	case len(data) >= 12 && bytes.Equal(data[:4], []byte("RIFF")) && bytes.Equal(data[8:12], []byte("WEBP")):
+		return "image", "image/webp", ".webp"
+	case len(data) >= 12 && bytes.Equal(data[4:8], []byte("ftyp")):
+		brand := string(data[8:12])
+		if brand == "avif" || brand == "avis" {
+			return "image", "image/avif", ".avif"
+		}
+		return "video", "video/mp4", ".mp4"
+	case len(data) >= 4 && bytes.Equal(data[:4], []byte{0x1a, 0x45, 0xdf, 0xa3}):
+		return "video", "video/webm", ".webm"
+	}
+	return "", "", ""
+}
+
+func pickExtension(mimeType, source, expect string) string {
+	mimeType = strings.ToLower(mimeType)
+	for _, item := range []struct{ key, ext string }{{"mp4", ".mp4"}, {"webm", ".webm"}, {"png", ".png"}, {"jpeg", ".jpg"}, {"jpg", ".jpg"}, {"webp", ".webp"}, {"gif", ".gif"}} {
+		if strings.Contains(mimeType, item.key) {
+			return item.ext
+		}
+	}
+	lower := strings.ToLower(source)
+	for _, ext := range []string{".mp4", ".webm", ".png", ".jpg", ".webp"} {
+		if strings.Contains(lower, ext) {
+			return ext
+		}
+	}
+	if expect == "video" {
+		return ".mp4"
+	}
+	return ".png"
+}
+
+func (e *Engine) saveMedia(data []byte, _ string, source, expect string) (*protocol.ImageResult, error) {
+	if len(data) == 0 || int64(len(data)) > e.cfg.MaxMediaBytes {
+		return nil, errors.New("媒体内容为空或超过大小限制")
+	}
+	kind, _, ext := detectMediaType(data)
+	if kind == "" {
+		return nil, errors.New("无法识别媒体类型，拒绝交付不可验证的文件")
+	}
+	if kind != expect {
+		return nil, fmt.Errorf("期望生成 %s，但提取结果为 %s，拒绝交付错误类型", expect, kind)
+	}
+	name, err := randomMediaName(ext)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(e.cfg.MediaDir, 0o700); err != nil {
+		return nil, err
+	}
+	tmp, err := os.CreateTemp(e.cfg.MediaDir, ".download-*")
+	if err != nil {
+		return nil, err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0o600); err == nil {
+		_, err = tmp.Write(data)
+	}
+	if closeErr := tmp.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := os.Rename(tmpName, filepath.Join(e.cfg.MediaDir, name)); err != nil {
+		return nil, err
+	}
+	base := strings.TrimRight(e.cfg.PublicBase, "/")
+	return &protocol.ImageResult{Filename: name, Kind: kind, URL: base + "/v1/media/" + name, Bytes: int64(len(data))}, nil
+}
+
+func (p *Page) downloadFallback(ctx context.Context, src string) ([]byte, string, string, error) {
+	before := map[string]bool{}
+	entries, _ := os.ReadDir(p.engine.cfg.DownloadDir)
+	for _, entry := range entries {
+		before[entry.Name()] = true
+	}
+	var clicked string
+	if err := p.conn.JS(ctx, `(function(src){var media=[...document.querySelectorAll('img,video')].find(function(m){return(m.currentSrc||m.src||'')===src;});var node=media&&media.closest('[data-testid^="hatch-chat-attachment-presentation-"]');if(!node)return 'none';node=node.closest('[class*="group/widget-presentation"]')||node;var b=[...node.querySelectorAll('button,[role=button]')].find(function(x){return /下载|保存|download/i.test(x.getAttribute('aria-label')||'');});if(!b)return 'none';b.click();return 'ok';})(`+jsString(src)+`)`, false, &clicked); err != nil || clicked != "ok" {
+		return nil, "", "", errors.New("未找到对应附件下载按钮")
+	}
+	deadline := time.Now().Add(3 * time.Minute)
+	for time.Now().Before(deadline) {
+		time.Sleep(1500 * time.Millisecond)
+		entries, _ := os.ReadDir(p.engine.cfg.DownloadDir)
+		var candidates []string
+		for _, entry := range entries {
+			if entry.Type().IsRegular() && !before[entry.Name()] && !strings.HasSuffix(entry.Name(), ".crdownload") {
+				candidates = append(candidates, entry.Name())
+			}
+		}
+		sort.Strings(candidates)
+		if len(candidates) > 0 {
+			name := candidates[len(candidates)-1]
+			path := filepath.Join(p.engine.cfg.DownloadDir, name)
+			file, err := os.Open(path)
+			if err != nil {
+				continue
+			}
+			data, readErr := io.ReadAll(io.LimitReader(file, p.engine.cfg.MaxMediaBytes+1))
+			_ = file.Close()
+			_ = os.Remove(path)
+			if readErr == nil && len(data) > 0 && int64(len(data)) <= p.engine.cfg.MaxMediaBytes {
+				return data, "", name, nil
+			}
+		}
+	}
+	return nil, "", "", errors.New("附件下载超时")
+}
+
+func (e *Engine) Generate(ctx context.Context, credentials protocol.AccountCredentials, prompt, expect, reference string) (result *protocol.ImageResult, updated protocol.AccountCredentials, returnErr error) {
+	e.opMu.Lock()
+	defer e.opMu.Unlock()
+	updated = cloneCredentials(credentials)
+	timeout := e.cfg.ImageTimeout
+	if expect == "video" {
+		timeout = e.cfg.VideoTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	page, err := e.authenticatedPage(ctx, credentials)
+	if err != nil {
+		return nil, updated, err
+	}
+	defer page.close()
+	defer func() {
+		syncCtx, syncCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		updated = page.readCredentials(syncCtx, updated)
+		syncCancel()
+	}()
+	_ = page.conn.JS(ctx, scrollBottomJS, false, nil)
+	if reference != "" {
+		if err := page.attachImage(ctx, reference); err != nil {
+			return nil, updated, err
+		}
+	} else {
+		page.clearAttachments(ctx)
+	}
+	before, _ := page.attachments(ctx)
+	baseline := map[string]bool{}
+	for _, item := range before {
+		for _, source := range []string{item.Src, item.VSrc, item.ISrc} {
+			if source != "" {
+				baseline[source] = true
+			}
+		}
+	}
+	state, _ := page.chatState(ctx)
+	clicked, err := page.sendPrompt(ctx, prompt)
+	if err != nil {
+		return nil, updated, err
+	}
+	if clicked != "clicked" && clicked != "enter-sent" {
+		return nil, updated, errors.New("提示词发送未确认，已停止生成")
+	}
+	found, err := page.waitAttachment(ctx, baseline, state.Count, len(before), expect)
+	if err != nil {
+		return nil, updated, err
+	}
+	source := mediaSource(*found, expect)
+	data, mimeType, finalURL, extractErr := page.extractBytes(ctx, source)
+	if extractErr != nil {
+		data, mimeType, finalURL, extractErr = page.downloadFallback(ctx, source)
+	}
+	if extractErr != nil {
+		return nil, updated, errors.New("已生成但未能取回媒体文件")
+	}
+	result, err = e.saveMedia(data, mimeType, finalURL, expect)
+	return result, updated, err
+}
