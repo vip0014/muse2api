@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
@@ -23,8 +24,44 @@ func (p *Page) dismissQuotaUI(ctx context.Context) {
 		for _, eventType := range []string{"keyDown", "keyUp"} {
 			_ = p.conn.Call(ctx, "Input.dispatchKeyEvent", map[string]any{"type": eventType, "key": "Escape", "code": "Escape", "windowsVirtualKeyCode": 27, "nativeVirtualKeyCode": 27}, nil)
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 	}
+}
+
+// waitQuotaReady waits only for the settings control, not the chat textarea.
+// The quota panel lives behind the account menu and can open while the chat VM
+// is still connecting, which removes a large chunk of first-refresh latency.
+func (p *Page) waitQuotaReady(ctx context.Context) error {
+	deadline := time.Now().Add(p.engine.cfg.LoginWait)
+	for time.Now().Before(deadline) {
+		var state string
+		err := p.conn.JS(ctx, `(function(){
+			if (document.readyState !== 'complete') return 'loading';
+			var h = document.querySelector('[data-hatch-shell-hydration-state]');
+			if (h && h.getAttribute('data-hatch-shell-hydration-state') !== 'hydrated') return 'hydrating';
+			const visible=e=>e.getClientRects().length>0&&getComputedStyle(e).visibility!=='hidden';
+			const labels=['Settings','設定','设置'];
+			const b=[...document.querySelectorAll('[data-testid="hatch-dock-more"]')].find(visible)||[...document.querySelectorAll('button,[role=button]')].find(e=>visible(e)&&labels.includes((e.getAttribute('aria-label')||'').trim()));
+			if (b) return 'ready';
+			const body=document.body?(document.body.innerText||''):'';
+			if (/log in|sign in|登录|登入/i.test(body)) return 'logged-out';
+			return 'waiting';
+		})()`, false, &state)
+		if err == nil {
+			switch state {
+			case "ready":
+				return nil
+			case "logged-out":
+				return fmt.Errorf("网页会话已登出: %w", protocol.ErrSessionExpired)
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(80 * time.Millisecond):
+		}
+	}
+	return errors.New("muse.ai 页面未出现设置入口，额度面板无法打开")
 }
 
 func (p *Page) quotaClick(ctx context.Context, expression, errorMessage string) error {
@@ -40,7 +77,7 @@ func (p *Page) quotaClick(ctx context.Context, expression, errorMessage string) 
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(150 * time.Millisecond):
+		case <-time.After(80 * time.Millisecond):
 		}
 	}
 	return errors.New(errorMessage)
@@ -141,7 +178,7 @@ func (e *Engine) Quota(ctx context.Context, credentials protocol.AccountCredenti
 	updated = cloneCredentials(credentials)
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
-	page, err := e.authenticatedPage(ctx, credentials)
+	page, err := e.authenticatedPageForQuota(ctx, credentials)
 	if err != nil {
 		return quota, updated, err
 	}
@@ -178,7 +215,7 @@ func (e *Engine) Quota(ctx context.Context, credentials protocol.AccountCredenti
 		select {
 		case <-ctx.Done():
 			return quota, updated, ctx.Err()
-		case <-time.After(200 * time.Millisecond):
+		case <-time.After(100 * time.Millisecond):
 		}
 	}
 	return quota, updated, errors.New("额度面板未读到有效用量；旧缓存未覆盖")

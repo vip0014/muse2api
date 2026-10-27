@@ -43,12 +43,31 @@ type Server struct {
 	adminPass    string
 	keyMu        sync.RWMutex
 	apiKey       string
+	autoCheck    *autoChecker
 }
 
 func New(cfg config.Config, store *storage.Store, driver protocol.Driver, log *slog.Logger) *Server {
 	s := &Server{cfg: cfg, store: store, driver: driver, log: log, authLimiter: auth.NewLimiter(), loginLimiter: auth.NewLimiter(), sessions: auth.NewSessionManager(cfg.SessionTTL), adminUser: cfg.AdminUsername, adminPass: cfg.AdminPassword, apiKey: cfg.APIKey}
 	s.pool = scheduler.NewPool(store, cfg.Concurrency)
 	s.tasks = task.NewManager(store, task.ProcessorFunc(s.processTask), cfg.Concurrency, cfg.QueueSize)
+	s.autoCheck = newAutoChecker()
+	s.autoCheck.wg.Add(1)
+	go s.autoCheckWorker()
+	if warmer, ok := driver.(interface{ Warm(context.Context) error }); ok && cfg.BrowserEnabled {
+		s.autoCheck.wg.Add(1)
+		go func() {
+			defer s.autoCheck.wg.Done()
+			ctx, cancel := context.WithTimeout(s.autoCheck.ctx, 90*time.Second)
+			defer cancel()
+			if err := warmer.Warm(ctx); err != nil {
+				if ctx.Err() == nil {
+					log.Warn("浏览器预热失败", "error", err)
+				}
+			} else {
+				log.Info("浏览器预热完成")
+			}
+		}()
+	}
 	return s
 }
 
@@ -60,6 +79,19 @@ func (s *Server) Close() {
 	defer cancel()
 	if err := s.tasks.Shutdown(ctx); err != nil {
 		s.log.Warn("任务管理器关闭超时", "error", err)
+	}
+	if s.autoCheck != nil {
+		s.autoCheck.cancel()
+		done := make(chan struct{})
+		go func() {
+			s.autoCheck.wg.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			s.log.Warn("后台检测退出超时")
+		}
 	}
 	driverDone := make(chan struct{})
 	go func() {

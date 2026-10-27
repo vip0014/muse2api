@@ -174,6 +174,8 @@ MUSE2API_PUBLIC_BASE=https://api.example.com
 
 保存后点“检测”确认会话有效。只导入自己的账号；Cookie 失效后重新登录上游再更新。
 
+导入成功后后台会自动检测会话并刷新额度，账号列表会轮询更新状态；批量导入按队列逐个处理，不需要再手动点“检测”和“刷新额度”。
+
 也可以用仓库自带的浏览器插件导出：在 Chrome / Edge 的扩展页开启开发者模式，加载 `browser-extension/` 目录，登录 muse.ai 后点击扩展图标即可复制 Cookie Header 或 JSON。也可以直接下载 [ZIP 包](https://github.com/vip0014/muse2api/releases/download/browser-extension-v1.0.0/muse2api-cookie-exporter-1.0.0.zip)，解压后加载。安装与使用说明见 [browser-extension/README.md](browser-extension/README.md)。
 
 ### 验证 API

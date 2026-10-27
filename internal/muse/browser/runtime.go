@@ -398,6 +398,21 @@ func cloneCredentials(in protocol.AccountCredentials) protocol.AccountCredential
 }
 
 func (e *Engine) authenticatedPage(ctx context.Context, credentials protocol.AccountCredentials) (*Page, error) {
+	return e.authenticatedPageWith(ctx, credentials, func(page *Page) error {
+		return page.waitReady(ctx)
+	})
+}
+
+// authenticatedPageForQuota only waits for the account menu. It does not wait
+// for a usable chat textarea, which is unnecessary for reading the quota panel
+// and can be much slower while the upstream VM is still warming up.
+func (e *Engine) authenticatedPageForQuota(ctx context.Context, credentials protocol.AccountCredentials) (*Page, error) {
+	return e.authenticatedPageWith(ctx, credentials, func(page *Page) error {
+		return page.waitQuotaReady(ctx)
+	})
+}
+
+func (e *Engine) authenticatedPageWith(ctx context.Context, credentials protocol.AccountCredentials, ready func(*Page) error) (*Page, error) {
 	page, err := e.openPage(ctx)
 	if err != nil {
 		return nil, err
@@ -414,7 +429,7 @@ func (e *Engine) authenticatedPage(ctx context.Context, credentials protocol.Acc
 	if err := page.conn.Call(ctx, "Page.navigate", map[string]any{"url": e.threadURL()}, nil); err != nil {
 		return nil, err
 	}
-	if err := page.waitReady(ctx); err != nil {
+	if err := ready(page); err != nil {
 		return nil, err
 	}
 	ok = true

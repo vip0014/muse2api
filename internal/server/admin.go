@@ -115,13 +115,16 @@ func (s *Server) addAccounts(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	for _, a := range added {
+		s.enqueueAutoCheck(a.ID)
+	}
 	s.pool.Wake()
 	miss := []string{}
 	for k := range missing {
 		miss = append(miss, k)
 	}
 	sort.Strings(miss)
-	writeJSON(w, 201, map[string]any{"added": added, "count": len(added), "essential_missing": miss, "warning": map[bool]string{true: "部分核心 Cookie 缺失，该账号可能无法使用", false: ""}[len(miss) > 0]})
+	writeJSON(w, 201, map[string]any{"added": added, "count": len(added), "essential_missing": miss, "auto_check": len(added) > 0, "warning": map[bool]string{true: "部分核心 Cookie 缺失，该账号可能无法使用", false: ""}[len(miss) > 0]})
 }
 func parseCookies(text string) map[string]string {
 	out := map[string]string{}
@@ -257,29 +260,32 @@ func (s *Server) updateCookies(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, r, err)
 		return
 	}
+	s.enqueueAutoCheck(a.ID)
 	s.pool.Wake()
-	writeJSON(w, 200, map[string]any{"ok": true, "id": a.ID, "cookie_count": a.CookieCount, "expires_at": a.ExpiresAt})
+	writeJSON(w, 200, map[string]any{"ok": true, "id": a.ID, "cookie_count": a.CookieCount, "expires_at": a.ExpiresAt, "auto_check": true})
 }
-func (s *Server) testAccount(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	a, err := s.store.GetAccount(id)
-	if err != nil {
-		apierr.Write(w, r, apierr.NotFound("账号不存在"))
-		return
-	}
-	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.HTTPTimeout)
-	defer cancel()
-	session, checkErr := s.driver.CheckSession(ctx, protocol.AccountCredentials{ID: a.ID, Cookies: a.Cookies, CookieExpiry: a.CookieExpiry})
+
+type sessionCheckResult struct {
+	OK      bool
+	Session *protocol.Session
+	Message string
+}
+
+func (s *Server) checkAndStoreSession(ctx context.Context, account model.Account) sessionCheckResult {
+	session, checkErr := s.driver.CheckSession(ctx, protocol.AccountCredentials{ID: account.ID, Cookies: account.Cookies, CookieExpiry: account.CookieExpiry})
 	ok := checkErr == nil && session != nil && session.Valid
-	_, _ = s.store.UpdateAccount(id, func(a *model.Account) error {
+	if _, err := s.store.UpdateAccount(account.ID, func(a *model.Account) error {
 		a.LastChecked = time.Now().Unix()
 		if ok {
 			a.Status = model.AccountActive
 			a.OK = boolPtr(true)
 			a.LastError = ""
 			a.Note = "会话有效"
-			a.Cookies = session.Cookies
-			a.CookieExpiry = session.CookieExpiry
+			if len(session.Cookies) > 0 {
+				a.Cookies = session.Cookies
+				a.CookieExpiry = session.CookieExpiry
+			}
+			a.SyncedAt = time.Now().Unix()
 			if exp := session.CookieExpiry["hatch_vml"]; exp > 0 {
 				a.ExpiresAt = exp
 				a.ExpiryEstimated = false
@@ -294,16 +300,37 @@ func (s *Server) testAccount(w http.ResponseWriter, r *http.Request) {
 			a.Note = "检测未确认，保留此前有效状态"
 		}
 		return nil
-	})
+	}); err != nil {
+		s.log.Warn("会话检测写入失败", "account", account.ID, "error", err)
+	}
+	message := safeUpstreamError(checkErr)
+	if ok {
+		message = "会话有效"
+	} else if message == "" {
+		message = "会话状态未确认"
+	}
+	return sessionCheckResult{OK: ok, Session: session, Message: message}
+}
+
+func (s *Server) testAccount(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	a, err := s.store.GetAccount(id)
+	if err != nil {
+		apierr.Write(w, r, apierr.NotFound("账号不存在"))
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.HTTPTimeout)
+	defer cancel()
+	result := s.checkAndStoreSession(ctx, a)
 	s.pool.Wake()
 	var sessionView map[string]any
-	if session != nil {
+	if result.Session != nil {
 		sessionView = map[string]any{
-			"valid": session.Valid, "status": session.Status, "vm_id": session.VMID,
-			"vm_state": session.VMState, "checked_at": session.CheckedAt,
+			"valid": result.Session.Valid, "status": result.Session.Status, "vm_id": result.Session.VMID,
+			"vm_state": result.Session.VMState, "checked_at": result.Session.CheckedAt,
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": ok, "message": map[bool]string{true: "会话有效", false: safeUpstreamError(checkErr)}[ok], "session": sessionView})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": result.OK, "message": result.Message, "session": sessionView})
 }
 
 type quotaDriver interface {

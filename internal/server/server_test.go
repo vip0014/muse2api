@@ -454,3 +454,36 @@ func TestQuotaPanicIsRecovered(t *testing.T) {
 		t.Fatalf("unexpected %d %s", rec.Code, rec.Body.String())
 	}
 }
+
+type autoQuotaDriver struct{ fakeDriver }
+
+func (d *autoQuotaDriver) CheckSession(context.Context, protocol.AccountCredentials) (*protocol.Session, error) {
+	return &protocol.Session{
+		Valid: true, Status: "assigned", CheckedAt: time.Now().Unix(),
+		Cookies:      map[string]string{"hatch_sess": "s", "hatch_vml": "v", "hatch_native_auth_device": "d"},
+		CookieExpiry: map[string]int64{"hatch_vml": time.Now().Add(time.Hour).Unix()},
+	}, nil
+}
+
+func (d *autoQuotaDriver) QueryQuota(context.Context, protocol.AccountCredentials) (*model.Quota, error) {
+	return &model.Quota{Found: true, Plan: "Free plan", CheckedAt: time.Now().Unix()}, nil
+}
+
+func TestImportAutoChecksAndRefreshesQuota(t *testing.T) {
+	s, h := testServer(t, &autoQuotaDriver{})
+	cookie := adminLogin(t, h)
+	rec := adminRequest(h, "POST", "/admin/accounts", `{"label":"imported","cookie_header":"hatch_sess=s; hatch_vml=v; hatch_native_auth_device=d"}`, cookie)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("import %d %s", rec.Code, rec.Body.String())
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, account := range s.store.ListAccounts() {
+			if account.Label == "imported" && account.Quota != nil && account.Quota.Plan == "Free plan" {
+				return
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("imported account was not auto-checked and refreshed")
+}

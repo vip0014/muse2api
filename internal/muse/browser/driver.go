@@ -46,6 +46,12 @@ func (d *Driver) BrowserRunning() bool {
 	return d.engine.BrowserRunning()
 }
 
+// Warm starts Chromium before the first quota or generation request so the
+// import-triggered check does not pay the full startup cost.
+func (d *Driver) Warm(ctx context.Context) error {
+	return d.engine.start(ctx)
+}
+
 func (d *Driver) prepare(ctx context.Context, accountID string) (protocol.AccountCredentials, error) {
 	if accountID == "" {
 		return protocol.AccountCredentials{}, errors.New("没有指定上游账号")
