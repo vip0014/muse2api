@@ -609,14 +609,57 @@ func (s *Server) restore(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "restart_required": true})
 }
+func maskAPIKey(key string) string {
+	if key == "" {
+		return ""
+	}
+	if len(key) <= 8 {
+		return "…"
+	}
+	return key[:4] + "…" + key[len(key)-4:]
+}
+
 func (s *Server) apiKeyInfo(w http.ResponseWriter, r *http.Request) {
 	key := s.currentKey()
-	masked := ""
-	if len(key) > 8 {
-		masked = key[:4] + "…" + key[len(key)-4:]
-	}
-	writeJSON(w, 200, map[string]any{"configured": key != "", "api_key_masked": masked, "base_url": s.cfg.PublicBase + "/v1"})
+	writeJSON(w, 200, map[string]any{"configured": key != "", "api_key_masked": maskAPIKey(key), "base_url": s.cfg.PublicBase + "/v1"})
 }
+
+// revealAPIKey is intentionally separate from apiKeyInfo: the full secret is
+// only returned after re-entering the admin password, is never logged, and is
+// not included in the normal settings payload.
+func (s *Server) revealAPIKey(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Password string `json:"password"`
+	}
+	if err := decodeJSON(w, r, &in); err != nil {
+		apierr.Write(w, r, err)
+		return
+	}
+	if len(in.Password) > 1024 {
+		apierr.Write(w, r, apierr.BadRequest("密码过长"))
+		return
+	}
+	if !auth.CheckCredentials(s.adminUser, in.Password, s.adminUser, s.adminPass) {
+		if s.loginLimiter.Exceeded(r, s.cfg.TrustProxy) {
+			apierr.Write(w, r, apierr.New(429, "rate_limit_error", "验证尝试过于频繁"))
+			return
+		}
+		s.loginLimiter.Fail(r, s.cfg.TrustProxy)
+		s.store.AddEvent(model.Event{Level: "warning", Type: "security.key.reveal_denied", Message: "API Key 查看密码验证失败", RequestID: requestIDFrom(r.Context())})
+		apierr.Write(w, r, apierr.New(http.StatusUnauthorized, "authentication_error", "管理员密码错误"))
+		return
+	}
+	s.loginLimiter.Reset(r, s.cfg.TrustProxy)
+	key := s.currentKey()
+	if key == "" {
+		apierr.Write(w, r, apierr.NotFound("API Key 未配置"))
+		return
+	}
+	s.store.AddEvent(model.Event{Level: "warning", Type: "security.key.reveal", Message: "API Key 已在管理台显示", RequestID: requestIDFrom(r.Context())})
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, map[string]any{"api_key": key})
+}
+
 func (s *Server) rotateAPIKey(w http.ResponseWriter, r *http.Request) {
 	key, err := auth.NewKey()
 	if err != nil {

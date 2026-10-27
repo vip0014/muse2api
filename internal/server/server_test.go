@@ -414,6 +414,23 @@ func TestAPIKeyRotation(t *testing.T) {
 	}
 }
 
+func TestRevealAPIKeyRequiresPassword(t *testing.T) {
+	_, h := testServer(t, &fakeDriver{})
+	cookie := adminLogin(t, h)
+	rec := adminRequest(h, "GET", "/admin/apikey", "", cookie)
+	if rec.Code != 200 || strings.Contains(rec.Body.String(), "test-secret") {
+		t.Fatalf("masked key leaked: %d %s", rec.Code, rec.Body.String())
+	}
+	rec = adminRequest(h, "POST", "/admin/apikey/reveal", `{"password":"wrong"}`, cookie)
+	if rec.Code != http.StatusUnauthorized || strings.Contains(rec.Body.String(), "test-secret") {
+		t.Fatalf("wrong password: %d %s", rec.Code, rec.Body.String())
+	}
+	rec = adminRequest(h, "POST", "/admin/apikey/reveal", `{"password":"test-admin-pass"}`, cookie)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "test-secret") {
+		t.Fatalf("reveal: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestStaticConsole(t *testing.T) {
 	_, h := testServer(t, &fakeDriver{})
 	rec := request(h, "GET", "/", "", "")

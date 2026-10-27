@@ -149,6 +149,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /admin/settings/backup", s.backup)
 	mux.HandleFunc("POST /admin/settings/restore", s.restore)
 	mux.HandleFunc("GET /admin/apikey", s.apiKeyInfo)
+	mux.HandleFunc("POST /admin/apikey/reveal", s.revealAPIKey)
 	mux.HandleFunc("POST /admin/apikey/rotate", s.rotateAPIKey)
 	mux.HandleFunc("GET /admin/logs", s.logs)
 	mux.HandleFunc("GET /admin/logs/export", s.exportLogs)

@@ -133,6 +133,7 @@ code, .mono { font-family: var(--mono); font-size: .92em; font-variant-numeric: 
 .field-error { font-size: 10.5px; color: var(--danger); }
 .form-stack { padding: 20px; display: flex; flex-direction: column; gap: 16px; }
 .credential-input { font-family: var(--mono); font-size: 11px; }
+.credential-reveal { padding: 11px 12px; border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--panel-2); font-family: var(--mono); font-size: 12px; line-height: 1.65; word-break: break-all; user-select: all; }
 .toolbar { padding: 11px 12px; display: flex; align-items: center; gap: 8px; }
 .search-box { position: relative; flex: 1; max-width: 360px; }
 .search-box svg { position: absolute; left: 11px; top: 50%; transform: translateY(-50%); color: var(--ink-3); }
