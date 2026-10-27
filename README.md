@@ -174,6 +174,8 @@ MUSE2API_PUBLIC_BASE=https://api.example.com
 
 保存后点“检测”确认会话有效。只导入自己的账号；Cookie 失效后重新登录上游再更新。
 
+也可以用仓库自带的浏览器插件导出：在 Chrome / Edge 的扩展页开启开发者模式，加载 `browser-extension/` 目录，登录 muse.ai 后点击扩展图标即可复制 Cookie Header 或 JSON。安装与使用说明见 [browser-extension/README.md](browser-extension/README.md)。
+
 ### 验证 API
 
 ```bash

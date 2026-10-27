@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Muse2API Cookie 导出</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header class="header">
+    <img class="logo" src="icons/icon-48.png" alt="" width="32" height="32">
+    <div class="title">
+      <h1>Muse2API Cookie 导出</h1>
+      <p>把 muse.ai 的登录凭据转成账号池导入格式</p>
+    </div>
+  </header>
+
+  <main>
+    <div class="field">
+      <label for="label">账号标签</label>
+      <div class="label-row">
+        <input id="label" type="text" maxlength="80" placeholder="例如：主账号" autocomplete="off">
+        <button id="refresh" class="button ghost" type="button">重新读取</button>
+      </div>
+    </div>
+
+    <div id="status" class="status" role="status" aria-live="polite">正在读取 muse.ai Cookie…</div>
+
+    <div class="formats" role="tablist" aria-label="导出格式">
+      <button class="format active" data-format="header" role="tab" aria-selected="true" type="button">Cookie Header</button>
+      <button class="format" data-format="json" role="tab" aria-selected="false" type="button">JSON</button>
+      <button class="format" data-format="batch" role="tab" aria-selected="false" type="button">批量行</button>
+    </div>
+
+    <textarea id="output" readonly spellcheck="false" aria-label="导出的 Cookie"></textarea>
+
+    <div class="actions">
+      <button id="copy" class="button primary" type="button" disabled>复制</button>
+      <a class="link" href="https://muse.ai" target="_blank" rel="noreferrer">打开 Muse</a>
+    </div>
+
+    <p class="hint">仅在本机读取 muse.ai 的 Cookie，不会上传到任何服务器。Cookie 等同于登录凭据，请勿分享。</p>
+  </main>
+
+  <script src="popup.js"></script>
+</body>
+</html>
