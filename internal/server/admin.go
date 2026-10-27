@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -320,13 +321,54 @@ func (s *Server) quota(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, r, apierr.NotFound("账号不存在"))
 		return
 	}
-	quota, err := driver.QueryQuota(r.Context(), protocol.AccountCredentials{ID: account.ID, Cookies: account.Cookies, CookieExpiry: account.CookieExpiry})
+	quota, err := s.queryQuota(r.Context(), driver, protocol.AccountCredentials{ID: account.ID, Cookies: account.Cookies, CookieExpiry: account.CookieExpiry})
 	if err != nil {
-		apierr.Write(w, r, mapDriverError(err))
+		s.log.Warn("quota query failed", "account", account.ID, "error", err)
+		apierr.Write(w, r, mapQuotaError(err))
 		return
 	}
-	_, _ = s.store.UpdateAccount(account.ID, func(a *model.Account) error { a.Quota = quota; return nil })
+	if _, err := s.store.UpdateAccount(account.ID, func(a *model.Account) error { a.Quota = quota; return nil }); err != nil {
+		s.log.Warn("quota persist failed", "account", account.ID, "error", err)
+	}
 	writeJSON(w, http.StatusOK, quota)
+}
+
+// queryQuota converts an unexpected panic in browser automation into a normal
+// error so the admin UI can show the real failure reason instead of a generic 500.
+func (s *Server) queryQuota(ctx context.Context, driver quotaDriver, credentials protocol.AccountCredentials) (quota *model.Quota, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			s.log.Error("quota query panic", "account", credentials.ID, "panic", recovered, "stack", string(debug.Stack()))
+			quota = nil
+			err = fmt.Errorf("额度查询内部错误: %v", recovered)
+		}
+	}()
+	return driver.QueryQuota(ctx, credentials)
+}
+
+func mapQuotaError(err error) error {
+	if errors.Is(err, protocol.ErrSessionExpired) {
+		return apierr.New(http.StatusUnauthorized, "auth_error", "上游 Session 已失效，请重新导入 Cookie")
+	}
+	var upstream *protocol.UpstreamError
+	if errors.As(err, &upstream) {
+		status := http.StatusBadGateway
+		if upstream.Status == http.StatusTooManyRequests {
+			status = http.StatusTooManyRequests
+		}
+		return apierr.New(status, "upstream_error", "额度读取失败："+safeUpstreamError(err))
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return apierr.New(http.StatusGatewayTimeout, "upstream_timeout", "额度读取超时，请稍后重试")
+	}
+	message := strings.TrimSpace(err.Error())
+	if message == "" {
+		message = "未知错误"
+	}
+	if runes := []rune(message); len(runes) > 300 {
+		message = string(runes[:300]) + "…"
+	}
+	return apierr.New(http.StatusBadGateway, "quota_error", "额度读取失败："+message)
 }
 func (s *Server) quotaAny(w http.ResponseWriter, r *http.Request) {
 	lease, err := s.pool.Acquire(r.Context())

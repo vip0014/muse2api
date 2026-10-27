@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -418,5 +419,38 @@ func TestStaticConsole(t *testing.T) {
 	rec := request(h, "GET", "/", "", "")
 	if rec.Code != 200 || !strings.Contains(rec.Body.String(), "<html") {
 		t.Fatalf("console %d", rec.Code)
+	}
+}
+
+type quotaErrorDriver struct {
+	fakeDriver
+	err        error
+	panicValue any
+}
+
+func (d *quotaErrorDriver) QueryQuota(context.Context, protocol.AccountCredentials) (*model.Quota, error) {
+	if d.panicValue != nil {
+		panic(d.panicValue)
+	}
+	return nil, d.err
+}
+
+func TestQuotaErrorIsExposed(t *testing.T) {
+	s, h := testServer(t, &quotaErrorDriver{err: errors.New("找不到设置入口")})
+	cookie := adminLogin(t, h)
+	id := s.store.ListAccounts()[0].ID
+	rec := adminRequest(h, "POST", "/admin/accounts/"+id+"/quota", "", cookie)
+	if rec.Code != http.StatusBadGateway || !strings.Contains(rec.Body.String(), "找不到设置入口") {
+		t.Fatalf("unexpected %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestQuotaPanicIsRecovered(t *testing.T) {
+	s, h := testServer(t, &quotaErrorDriver{panicValue: "boom"})
+	cookie := adminLogin(t, h)
+	id := s.store.ListAccounts()[0].ID
+	rec := adminRequest(h, "POST", "/admin/accounts/"+id+"/quota", "", cookie)
+	if rec.Code != http.StatusBadGateway || !strings.Contains(rec.Body.String(), "额度查询内部错误") {
+		t.Fatalf("unexpected %d %s", rec.Code, rec.Body.String())
 	}
 }

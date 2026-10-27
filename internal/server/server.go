@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -128,7 +129,7 @@ func (s *Server) recoverMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if recovered := recover(); recovered != nil {
-				s.log.Error("request panic", "path", r.URL.Path, "panic", recovered)
+				s.log.Error("request panic", "path", r.URL.Path, "panic", recovered, "stack", string(debug.Stack()))
 				apierr.Write(w, r, errors.New("panic"))
 			}
 		}()
