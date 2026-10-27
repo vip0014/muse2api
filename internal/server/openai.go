@@ -652,22 +652,18 @@ type videoAPIRequest struct {
 	ReferenceImage string `json:"reference_image"`
 }
 
-// Muse currently exposes one roughly 10-second clip per media task. The
-// 6-second task is a special upstream variant; longer videos require multiple
-// clips and are not implemented by this single-attachment driver.
+// Muse currently exposes one roughly 10-second clip per media task and has no
+// duration parameter. Keep 1..10 as request metadata for compatibility, but do
+// not let it change the prompt. Longer videos require multiple clips and are
+// not implemented by this single-attachment driver.
 func normalizeVideoDuration(duration int) (int, error) {
-	switch {
-	case duration <= 0:
+	if duration <= 0 {
 		return 0, nil
-	case duration == 6:
-		return 6, nil
-	case duration == 10:
-		return 10, nil
-	case duration > 10:
-		return 0, apierr.BadRequest("当前版本只生成单片段，官网单片段约 10 秒；多片段/最长约 60 秒尚未实现")
-	default:
-		return 0, apierr.BadRequest("视频单片段约 10 秒；duration 仅支持 6（6 秒特殊任务）或 10/留空（默认约 10 秒）")
 	}
+	if duration <= 10 {
+		return duration, nil
+	}
+	return 0, apierr.BadRequest("当前版本只生成单片段，官网单片段约 10 秒；多片段/最长约 60 秒尚未实现")
 }
 
 func (s *Server) createVideo(w http.ResponseWriter, r *http.Request) {

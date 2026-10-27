@@ -51,7 +51,6 @@ func buildImagePrompt(request protocol.ImageRequest) string {
 
 func buildVideoPrompt(request protocol.VideoRequest) string {
 	prompt := strings.TrimSpace(request.Prompt)
-	duration := request.Duration
 	hasReference := request.ReferenceImage != ""
 	ratio := strings.ToLower(strings.TrimSpace(request.AspectRatio + request.Size))
 	shape := "动态视频"
@@ -64,17 +63,9 @@ func buildVideoPrompt(request protocol.VideoRequest) string {
 	if hasReference {
 		prefix = "基于我本次上传的参考图片附件作为第一帧参考图（严禁使用历史图片或任何其他图像）"
 	}
-	result := fmt.Sprintf("%s：生成%s", prefix, shape)
-	// Muse currently produces one clip of roughly 10 seconds; duration is a
-	// prompt hint, not an upstream parameter. Omitting it keeps the official
-	// default. 6 seconds selects the special 6-second task observed upstream.
-	switch duration {
-	case 6:
-		result += "，时长约 6 秒"
-	case 10:
-		result += "，单片段约 10 秒"
-	}
-	result += "：" + prompt
+	// Muse currently produces one clip of roughly 10 seconds. Duration is not
+	// an upstream parameter, so it is deliberately not written into the prompt.
+	result := fmt.Sprintf("%s：生成%s：%s", prefix, shape, prompt)
 	if request.Resolution != "" {
 		result += "，画质规格：" + request.Resolution
 	}

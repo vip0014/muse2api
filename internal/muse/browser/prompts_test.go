@@ -23,12 +23,10 @@ func TestBuildVideoPromptDefaultsAndShape(t *testing.T) {
 	if strings.Contains(prompt, "秒") || !strings.Contains(prompt, "9:16") || !strings.Contains(prompt, "海浪") {
 		t.Fatalf("default prompt must not force a duration: %s", prompt)
 	}
-	six := buildVideoPrompt(protocol.VideoRequest{Prompt: "镜头推进", Duration: 6, Resolution: "720p", ReferenceImage: "abc"})
-	if !strings.Contains(six, "6 秒") || !strings.Contains(six, "720p") || !strings.Contains(six, "第一帧") {
-		t.Fatalf("unexpected 6-second prompt: %s", six)
-	}
-	ten := buildVideoPrompt(protocol.VideoRequest{Prompt: "海岸", Duration: 10})
-	if !strings.Contains(ten, "10 秒") {
-		t.Fatalf("unexpected 10-second prompt: %s", ten)
+	// Duration is compatibility metadata only; even an explicit value must not
+	// invent a controllable duration in the prompt.
+	explicit := buildVideoPrompt(protocol.VideoRequest{Prompt: "镜头推进", Duration: 6, Resolution: "720p", ReferenceImage: "abc"})
+	if strings.Contains(explicit, "6 秒") || !strings.Contains(explicit, "720p") || !strings.Contains(explicit, "第一帧") {
+		t.Fatalf("unexpected explicit-duration prompt: %s", explicit)
 	}
 }
