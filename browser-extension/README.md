@@ -2,6 +2,16 @@
 
 一个 Chrome / Edge Manifest V3 扩展，用来读取 `muse.ai` 的登录 Cookie，并生成 Muse2API 账号池可以直接使用的格式。
 
+## 下载
+
+直接下载打包好的 ZIP：
+
+<https://github.com/vip0014/muse2api/releases/download/browser-extension-v1.0.0/muse2api-cookie-exporter-1.0.0.zip>
+
+SHA-256：`25772e0ff5cee98b255463fa8e43d953b03554b25b84c5941dcb53e5b5770563`
+
+解压后得到 `muse2api-cookie-exporter/` 目录，再按下面的“安装”步骤加载。
+
 ## 功能
 
 - 读取 `muse.ai` 及子域下的登录 Cookie

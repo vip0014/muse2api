@@ -9,6 +9,7 @@
 /web/node_modules/
 /web/dist/
 /web/tsconfig.tsbuildinfo
+/browser-extension/dist/
 /internal/server/static/*
 !/internal/server/static/index.html
 *.log
