@@ -221,11 +221,13 @@ func (d *Driver) CheckSession(ctx context.Context, credentials protocol.AccountC
 }
 
 func (d *Driver) QueryQuota(ctx context.Context, credentials protocol.AccountCredentials) (*model.Quota, error) {
-	prepared, err := d.prepare(ctx, credentials.ID)
-	if err != nil {
-		return nil, err
+	// Quota only needs the stored cookies: the settings panel is reachable
+	// without the HTTP pre-check or a VM wake. Skipping prepare removes a
+	// network round trip and the slowest part of a manual refresh.
+	if len(credentials.Cookies) == 0 {
+		return nil, errors.New("账号没有 Cookie")
 	}
-	quota, updated, err := d.engine.Quota(ctx, prepared)
+	quota, updated, err := d.engine.Quota(ctx, credentials)
 	d.persist(credentials.ID, updated, err)
 	if err != nil {
 		return nil, err

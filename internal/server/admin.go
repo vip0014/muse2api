@@ -285,7 +285,6 @@ func (s *Server) checkAndStoreSession(ctx context.Context, account model.Account
 				a.Cookies = session.Cookies
 				a.CookieExpiry = session.CookieExpiry
 			}
-			a.SyncedAt = time.Now().Unix()
 			if exp := session.CookieExpiry["hatch_vml"]; exp > 0 {
 				a.ExpiresAt = exp
 				a.ExpiryEstimated = false
