@@ -431,6 +431,19 @@ func TestRevealAPIKeyRequiresPassword(t *testing.T) {
 	}
 }
 
+func TestVideoDurationPolicy(t *testing.T) {
+	for _, duration := range []int{0, 6, 10} {
+		if _, err := normalizeVideoDuration(duration); err != nil {
+			t.Fatalf("duration %d rejected: %v", duration, err)
+		}
+	}
+	for _, duration := range []int{1, 5, 7, 8, 9, 11, 60} {
+		if _, err := normalizeVideoDuration(duration); err == nil {
+			t.Fatalf("duration %d should be rejected", duration)
+		}
+	}
+}
+
 func TestStaticConsole(t *testing.T) {
 	_, h := testServer(t, &fakeDriver{})
 	rec := request(h, "GET", "/", "", "")

@@ -652,12 +652,36 @@ type videoAPIRequest struct {
 	ReferenceImage string `json:"reference_image"`
 }
 
+// Muse currently exposes one roughly 10-second clip per media task. The
+// 6-second task is a special upstream variant; longer videos require multiple
+// clips and are not implemented by this single-attachment driver.
+func normalizeVideoDuration(duration int) (int, error) {
+	switch {
+	case duration <= 0:
+		return 0, nil
+	case duration == 6:
+		return 6, nil
+	case duration == 10:
+		return 10, nil
+	case duration > 10:
+		return 0, apierr.BadRequest("当前版本只生成单片段，官网单片段约 10 秒；多片段/最长约 60 秒尚未实现")
+	default:
+		return 0, apierr.BadRequest("视频单片段约 10 秒；duration 仅支持 6（6 秒特殊任务）或 10/留空（默认约 10 秒）")
+	}
+}
+
 func (s *Server) createVideo(w http.ResponseWriter, r *http.Request) {
 	var req videoAPIRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Prompt) == "" {
 		apierr.Write(w, r, apierr.BadRequest("视频 prompt 不能为空且 JSON 必须有效"))
 		return
 	}
+	normalizedDuration, durationErr := normalizeVideoDuration(req.Duration)
+	if durationErr != nil {
+		apierr.Write(w, r, durationErr)
+		return
+	}
+	req.Duration = normalizedDuration
 	idempotencyKey := r.Header.Get("Idempotency-Key")
 	if len(idempotencyKey) > 256 {
 		apierr.Write(w, r, apierr.BadRequest("Idempotency-Key 过长"))

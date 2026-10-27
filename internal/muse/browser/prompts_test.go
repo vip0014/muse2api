@@ -20,11 +20,15 @@ func TestBuildImagePrompt(t *testing.T) {
 
 func TestBuildVideoPromptDefaultsAndShape(t *testing.T) {
 	prompt := buildVideoPrompt(protocol.VideoRequest{Prompt: "海浪", AspectRatio: "9:16"})
-	if !strings.Contains(prompt, "6 秒") || !strings.Contains(prompt, "9:16") || !strings.Contains(prompt, "海浪") {
-		t.Fatalf("unexpected default video prompt: %s", prompt)
+	if strings.Contains(prompt, "秒") || !strings.Contains(prompt, "9:16") || !strings.Contains(prompt, "海浪") {
+		t.Fatalf("default prompt must not force a duration: %s", prompt)
 	}
-	custom := buildVideoPrompt(protocol.VideoRequest{Prompt: "镜头推进", Duration: 8, Resolution: "1080p", ReferenceImage: "abc"})
-	if !strings.Contains(custom, "8 秒") || !strings.Contains(custom, "1080p") || !strings.Contains(custom, "第一帧") {
-		t.Fatalf("unexpected custom video prompt: %s", custom)
+	six := buildVideoPrompt(protocol.VideoRequest{Prompt: "镜头推进", Duration: 6, Resolution: "720p", ReferenceImage: "abc"})
+	if !strings.Contains(six, "6 秒") || !strings.Contains(six, "720p") || !strings.Contains(six, "第一帧") {
+		t.Fatalf("unexpected 6-second prompt: %s", six)
+	}
+	ten := buildVideoPrompt(protocol.VideoRequest{Prompt: "海岸", Duration: 10})
+	if !strings.Contains(ten, "10 秒") {
+		t.Fatalf("unexpected 10-second prompt: %s", ten)
 	}
 }
