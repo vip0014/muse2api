@@ -3,7 +3,7 @@ import { useMutation, useQuery } from '@tanstack/react-query'
 import { Archive, CheckCircle2, Copy, Eye, KeyRound, RotateCcw, Server, ShieldCheck, SlidersHorizontal, Timer, Wrench } from 'lucide-react'
 import { api } from '../lib/api'
 import type { ServiceConfig } from '../lib/types'
-import { Button, ErrorState, Field, InlineError, Input, Loading, PageHeader, SuccessMessage } from '../components/UI'
+import { Button, ErrorState, Field, InlineError, Input, Loading, PageHeader, RefreshError, SuccessMessage } from '../components/UI'
 import { Confirm, Modal } from '../components/Dialog'
 
 type APIKeyInfo = { configured: boolean; api_key_masked: string; base_url: string }
@@ -68,18 +68,23 @@ export default function Settings() {
     window.setTimeout(() => setCopyState(''), 1500)
   }
 
-  if (isLoading) return <div className="page-stack"><PageHeader title="系统设置" /><Loading /></div>
-  if (error || !data) return <div className="page-stack"><PageHeader title="系统设置" /><ErrorState message={error instanceof Error ? error.message : '加载失败'} retry={() => refetch()} /></div>
+  const loadError = Boolean(error && !data)
+  const refreshError = Boolean(error && data)
+
+  if (isLoading) return <div className="page-stack"><PageHeader title="系统设置" kicker="系统" /><Loading /></div>
+  if (!data) return <div className="page-stack"><PageHeader title="系统设置" kicker="系统" /><ErrorState message={error instanceof Error ? error.message : loadError ? '加载失败' : '暂无数据'} retry={() => refetch()} /></div>
   const c = data.config
   const maskedKey = keyInfo.isLoading ? '加载中…' : keyInfo.error ? '读取失败' : keyInfo.data?.configured ? keyInfo.data.api_key_masked : '未配置'
 
   return <div className="page-stack">
     <PageHeader title="系统设置" description="服务端配置与安全边界；改动通过环境变量或部署流程生效。" kicker="系统" />
+    {refreshError && <RefreshError message={error instanceof Error ? error.message : '无法刷新配置'} retry={() => refetch()} />}
     {notice && <SuccessMessage>{notice}</SuccessMessage>}
     {message && <InlineError>{message}</InlineError>}
     <div className="settings-layout">
       <nav className="settings-nav" aria-label="设置分区">
-        {sections.map(({ id, label, icon: Icon }) => <button key={id} className={active === id ? 'active' : ''} onClick={() => go(id)}><Icon size={14} />{label}</button>)}
+        <div className="nav-caption">配置分区</div>
+        {sections.map(({ id, label, icon: Icon }) => <button key={id} className={active === id ? 'active' : ''} onClick={() => go(id)} aria-current={active === id ? 'true' : undefined}><Icon size={14} />{label}</button>)}
       </nav>
       <div className="settings-content">
         <section className="settings-section" id="settings-service">
@@ -102,7 +107,7 @@ export default function Settings() {
             <Setting label="Base URL" value={keyInfo.data?.base_url || '—'} mono />
           </dl>
           <div className="maintenance-row">
-            <div className="maintenance-icon"><Eye size={18} /></div>
+            <div className="maintenance-icon"><Eye size={16} /></div>
             <div><strong>查看完整 API Key</strong><p>需要再次输入管理员密码；查看与拒绝都会写入审计日志，30 秒后自动隐藏。</p></div>
             <Button variant="secondary" disabled={!keyInfo.data?.configured || reveal.isPending} onClick={() => { setRevealError(''); setRevealOpen(true) }}><Eye size={15} />显示</Button>
           </div>
@@ -131,26 +136,26 @@ export default function Settings() {
 
         <section className="settings-section" id="settings-security">
           <SectionHead icon={ShieldCheck} title="安全状态" description="凭据加密、会话保护与请求防护。" />
-          <div className="security-checks">
-            <span className={c.credential_encryption ? '' : 'is-warn'}><CheckCircle2 size={15} />凭据加密 {c.credential_encryption ? '已启用' : '未启用'}</span>
-            <span><CheckCircle2 size={15} />恒定时间校验</span>
-            <span><CheckCircle2 size={15} />CSRF / CORS 防护</span>
-            <span><CheckCircle2 size={15} />原生 CDP 运行时</span>
-            <span className={c.ref_image_local_files ? 'is-warn' : ''}><CheckCircle2 size={15} />参考图本地文件 {c.ref_image_local_files ? '已允许' : '已禁止'}</span>
-            <span className={c.ref_image_private_fetch ? 'is-warn' : ''}><CheckCircle2 size={15} />参考图私网抓取 {c.ref_image_private_fetch ? '已允许' : '已禁止'}</span>
-            <span><CheckCircle2 size={15} />请求体上限 {c.max_upload_bytes ? `${Math.round(c.max_upload_bytes / 1024 / 1024)} MiB` : '—'}</span>
+          <div className="security-grid">
+            <SecurityItem label="凭据加密" value={c.credential_encryption ? '已启用' : '未启用'} warn={!c.credential_encryption} />
+            <SecurityItem label="恒定时间校验" value="已启用" />
+            <SecurityItem label="CSRF / CORS 防护" value="已启用" />
+            <SecurityItem label="原生 CDP 运行时" value="已启用" />
+            <SecurityItem label="参考图本地文件" value={c.ref_image_local_files ? '已允许' : '已禁止'} warn={Boolean(c.ref_image_local_files)} />
+            <SecurityItem label="参考图私网抓取" value={c.ref_image_private_fetch ? '已允许' : '已禁止'} warn={Boolean(c.ref_image_private_fetch)} />
+            <SecurityItem label="请求体上限" value={c.max_upload_bytes ? `${Math.round(c.max_upload_bytes / 1024 / 1024)} MiB` : '—'} />
           </div>
         </section>
 
         <section className="settings-section" id="settings-maintenance">
           <SectionHead icon={Wrench} title="维护" description="备份元数据与轮换 API Key。" />
           <div className="maintenance-row">
-            <div className="maintenance-icon"><Archive size={18} /></div>
+            <div className="maintenance-icon"><Archive size={16} /></div>
             <div><strong>备份元数据</strong><p>账号密文、API Key、任务与审计事件；保存到 data/backups，不覆盖旧备份。</p></div>
             <Button variant="secondary" onClick={() => setBackupConfirm(true)}>创建备份</Button>
           </div>
           <div className="maintenance-row">
-            <div className="maintenance-icon"><KeyRound size={18} /></div>
+            <div className="maintenance-icon"><KeyRound size={16} /></div>
             <div><strong>轮换 API Key</strong><p>旧 Key 立即失效，新 Key 会在弹窗中显示并可复制。</p></div>
             <Button variant="danger" onClick={() => setRotateConfirm(true)}><RotateCcw size={15} />轮换</Button>
           </div>
@@ -179,3 +184,7 @@ function SectionHead({ icon: Icon, title, description }: { icon: typeof Server; 
 }
 
 function Setting({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) { return <div><dt>{label}</dt><dd className={mono ? 'mono' : ''}>{value}</dd></div> }
+
+function SecurityItem({ label, value, warn = false }: { label: string; value: string; warn?: boolean }) {
+  return <div className={`security-item ${warn ? 'is-warn' : ''}`}><CheckCircle2 size={15} /><div><strong>{label}</strong><span>{value}</span></div></div>
+}

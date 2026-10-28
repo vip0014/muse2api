@@ -3,8 +3,10 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#edf1f5" />
+    <meta name="theme-color" content="#ffffff" />
     <meta name="description" content="Muse2API 单管理员运维控制台" />
+    <link rel="preload" href="/fonts/inter-latin.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="preload" href="/fonts/jetbrains-mono-latin.woff2" as="font" type="font/woff2" crossorigin />
     <script>
       (() => {
         try {
@@ -13,7 +15,7 @@
           document.documentElement.dataset.theme = theme;
           document.documentElement.style.colorScheme = theme;
           const meta = document.querySelector('meta[name="theme-color"]');
-          if (meta) meta.setAttribute('content', theme === 'dark' ? '#0b121b' : '#edf1f5');
+          if (meta) meta.setAttribute('content', theme === 'dark' ? '#0b0b0e' : '#ffffff');
         } catch {}
       })();
     </script>
@@ -22,7 +24,7 @@
     <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png" />
     <link rel="icon" type="image/png" sizes="48x48" href="/favicon-48.png" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
-    <title>Muse2API Console</title>
+    <title>Muse2API · Operator Console</title>
   </head>
   <body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body>
 </html>

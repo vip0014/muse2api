@@ -105,12 +105,17 @@ export function CommandPalette({ open, onOpenChange, onLogout }: { open: boolean
             }}
             placeholder="搜索页面、账号或任务…"
             aria-label="搜索或跳转"
+            role="combobox"
+            aria-expanded="true"
+            aria-autocomplete="list"
+            aria-controls="command-results"
+            aria-activedescendant={activeId ? `command-option-${activeId}` : undefined}
             autoComplete="off"
             spellCheck={false}
           />
           <kbd>ESC</kbd>
         </div>
-        <div className="command-results" role="listbox" aria-label="命令">
+        <div id="command-results" className="command-results" role="listbox" aria-label="命令">
           {groups.length === 0 && <div className="command-empty">没有匹配的结果。换个关键词，或直接打开账号池 / 任务中心。</div>}
           {groups.map(([group, items]) => <div className="command-group" key={group}>
             <div className="command-group-label">{group}</div>
@@ -120,6 +125,7 @@ export function CommandPalette({ open, onOpenChange, onLogout }: { open: boolean
               const Icon = item.icon as ComponentType<{ size?: number; strokeWidth?: number }>
               return <button
                 key={item.id}
+                id={`command-option-${item.id}`}
                 type="button"
                 role="option"
                 aria-selected={activeId === item.id}

@@ -47,7 +47,7 @@
 
 ## 🖥️ 后台长什么样
 
-![后台账号池页面](docs/screenshots/admin-accounts.png)
+![控制台界面预览：登录、浅色总览与深色任务中心](docs/screenshots/ui-preview.gif)
 
 ## 🚀 跑起来
 

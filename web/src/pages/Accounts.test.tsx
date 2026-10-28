@@ -40,7 +40,8 @@ describe('Accounts page', () => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: 0 } } })
     render(<QueryClientProvider client={client}><Accounts /></QueryClientProvider>)
 
-    expect(await screen.findByText('主账号')).toBeInTheDocument()
+    expect(await screen.findByRole('heading', { name: '主账号' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '查看 主账号' })).toBeInTheDocument()
     expect(screen.getByText(/3 条 Cookie/)).toBeInTheDocument()
     await userEvent.click(screen.getByRole('button', { name: '检测' }))
     expect(await screen.findByText('会话有效')).toBeInTheDocument()

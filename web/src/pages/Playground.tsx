@@ -1,6 +1,6 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { Check, ChevronRight, Clipboard, Play, Square, Terminal, Zap } from 'lucide-react'
+import { Check, ChevronRight, Clipboard, KeyRound, Play, Square, Zap } from 'lucide-react'
 import { api, apiRaw } from '../lib/api'
 import { Button, Field, InlineError, PageHeader, Panel, Select } from '../components/UI'
 
@@ -26,7 +26,14 @@ export default function Playground() {
   const [output, setOutput] = useState('')
   const [error, setError] = useState('')
   const [copied, setCopied] = useState(false)
+  const [responseCopied, setResponseCopied] = useState(false)
+  const outputRef = useRef<HTMLPreElement>(null)
   const { data } = useQuery({ queryKey: ['models'], queryFn: ({ signal }) => api<{ data: Model[] }>('/v1/models', { signal }) })
+
+  useEffect(() => {
+    if (!sending || !outputRef.current) return
+    outputRef.current.scrollTop = outputRef.current.scrollHeight
+  }, [output, sending])
 
   const changeEndpoint = (value: Endpoint) => {
     setEndpoint(value)
@@ -72,13 +79,22 @@ export default function Playground() {
     setCopied(true)
     window.setTimeout(() => setCopied(false), 1500)
   }
+  const copyResponse = async () => {
+    if (!output) return
+    await navigator.clipboard.writeText(output)
+    setResponseCopied(true)
+    window.setTimeout(() => setResponseCopied(false), 1500)
+  }
+
+  const statusLabel = status === undefined ? (sending ? '请求中' : '待发送') : `${status}`
+  const statusClass = status === undefined ? '' : status >= 400 ? 'bad' : 'ok'
 
   return <div className="page-stack">
-    <PageHeader title="API 调试台" description="直接向本地服务发起请求，确认鉴权、模型与流式响应。" kicker="工具" actions={<span className="metric-inline"><Zap size={13} />请求会使用当前管理员会话</span>} />
+    <PageHeader title="API 调试台" description="直接向本地服务发起请求，确认鉴权、模型与流式响应。" kicker="工具" actions={<span className="session-chip"><KeyRound size={12} />管理员会话</span>} />
     <div className="playground-grid">
       <Panel className="request-panel">
         <div className="section-head"><div><h2>请求</h2><p>{endpoints[endpoint].hint}</p></div><span className="secondary-cell mono">{endpoints[endpoint].path}</span></div>
-        <div className="endpoint-tabs" role="tablist" aria-label="接口类型">
+        <div className="endpoint-switch" role="tablist" aria-label="接口类型">
           {(Object.keys(endpoints) as Endpoint[]).map(key => <button key={key} role="tab" aria-selected={endpoint === key} className={`endpoint-tab ${endpoint === key ? 'active' : ''}`} onClick={() => changeEndpoint(key)}><strong>{endpoints[key].label}</strong><span>POST</span></button>)}
         </div>
         <div className="playground-form">
@@ -89,30 +105,36 @@ export default function Playground() {
             </Select>
           </Field>
           <Field label={endpoint === 'chat' || endpoint === 'responses' ? '用户输入' : '提示词'} hint="⌘ / Ctrl + Enter 发送">
-            <textarea className="input textarea prompt-input" rows={8} value={prompt} onChange={event => setPrompt(event.target.value)} onKeyDown={event => { if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') { event.preventDefault(); void send() } }} />
+            <textarea className="input textarea prompt-input" rows={8} value={prompt} onChange={event => setPrompt(event.target.value)} onKeyDown={event => { if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') { event.preventDefault(); void send() } }} spellCheck={false} />
           </Field>
           {endpoint === 'video' && <p className="field-hint">官网单片段约 10 秒、720p；duration 不控制上游；比例只能靠提示词；长视频请分段生成，本项目不做拼接。</p>}
           {(endpoint === 'chat' || endpoint === 'responses') && <label className="switch-row"><strong>SSE 流式响应</strong><input type="checkbox" checked={stream} onChange={event => setStream(event.target.checked)} /></label>}
           <div className="request-actions">
             <Button onClick={send} disabled={sending || !prompt.trim()}><Play size={15} />{sending ? '请求中…' : '发送'}</Button>
             {sending && <Button variant="secondary" onClick={() => controller?.abort()}><Square size={14} />取消</Button>}
-            <Button variant="ghost" onClick={() => void copyCurl()}>{copied ? <Check size={15} /> : <Clipboard size={15} />}复制 cURL</Button>
+            <Button variant="ghost" onClick={() => void copyCurl()}>{copied ? <Check size={15} /> : <Clipboard size={15} />}{copied ? '已复制' : '复制 cURL'}</Button>
           </div>
           <div className="endpoint-preview"><span>POST</span><code>{endpoints[endpoint].path}</code><ChevronRight size={12} /></div>
         </div>
       </Panel>
 
-      <Panel className="response-panel">
-        <div className="section-head"><div><h2>响应</h2><p>原始响应体与请求耗时</p></div><Terminal size={15} className="text-muted" /></div>
-        <div className="response-meta">
+      <section className="console-panel" aria-label="响应">
+        <div className="console-head">
+          <div className="console-lights" aria-hidden="true"><i /><i /><i /></div>
+          <strong>响应</strong>
+          <span className="spacer" />
+          {sending && <span className="console-status"><Zap size={10} />流式接收</span>}
+          <span className={`console-status ${statusClass}`}>{statusLabel}</span>
+        </div>
+        <div className="console-meta">
           <div><span>状态</span><strong className={status && status >= 400 ? 'text-danger' : status ? 'text-success' : ''}>{status ?? '—'}</strong></div>
           <div><span>耗时</span><strong>{elapsed !== undefined ? `${elapsed} ms` : '—'}</strong></div>
-          <div><span>请求 ID</span><strong className="mono">{requestID || '—'}</strong></div>
+          <div><span>请求 ID</span><strong className="mono" title={requestID || undefined}>{requestID || '—'}</strong></div>
         </div>
-        {error && <InlineError>{error}</InlineError>}
-        <pre className={`response-output ${!output ? 'is-empty' : ''}`} aria-live="polite">{output || (sending ? '等待响应…' : '响应将显示在这里')}</pre>
-        <div className="response-footer"><span>{output ? `${output.length} 字符` : '—'}</span><Button size="sm" variant="ghost" disabled={!output} onClick={() => void navigator.clipboard.writeText(output)}><Clipboard size={14} />复制</Button></div>
-      </Panel>
+        {error && <div className="console-error"><InlineError>{error}</InlineError></div>}
+        <pre ref={outputRef} className={`console-output ${!output ? 'is-empty' : ''} ${error ? 'is-error' : ''}`} aria-live="polite">{output || (sending ? '等待响应…' : '响应将显示在这里')}</pre>
+        <div className="console-foot"><span>{output ? `${output.length} 字符` : '—'}</span><Button size="sm" variant="ghost" disabled={!output} onClick={() => void copyResponse()}><Clipboard size={13} />{responseCopied ? '已复制' : '复制响应'}</Button></div>
+      </section>
     </div>
   </div>
 }

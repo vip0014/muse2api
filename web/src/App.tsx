@@ -1,7 +1,6 @@
 import { lazy, useEffect, useState } from 'react'
 import { BrowserRouter, Navigate, Route, Routes, useSearchParams } from 'react-router-dom'
 import { QueryClient, QueryClientProvider, useQueryClient } from '@tanstack/react-query'
-import { LoaderCircle } from 'lucide-react'
 import { api } from './lib/api'
 import { ThemeProvider } from './lib/theme'
 import { Layout } from './components/Layout'
@@ -46,7 +45,7 @@ function AppRoutes() {
     window.addEventListener('muse2api:unauthorized', handler)
     return () => { active = false; window.removeEventListener('muse2api:unauthorized', handler) }
   }, [client])
-  if (authenticated === null) return <div className="app-loading" role="status" aria-label="正在连接控制台"><img src="/logo.png" alt="Muse2API" width={58} height={34} /><LoaderCircle className="spin" size={18} /><span>正在连接控制台</span></div>
+  if (authenticated === null) return <div className="app-loading" role="status" aria-label="正在连接控制台"><img src="/logo.png" alt="Muse2API" width={58} height={34} /><div className="loading-line"><span /></div><span>正在连接控制台</span></div>
   if (!authenticated) return <Login onLogin={() => { client.clear(); setAuthenticated(true) }} />
   const logout = () => { void api('/admin/logout', { method: 'POST' }).finally(() => { client.clear(); setAuthenticated(false) }) }
   return <Routes><Route element={<Layout onLogout={logout} />}><Route index element={<Dashboard />} /><Route path="accounts" element={<AccountsRoute />} /><Route path="tasks" element={<TasksRoute />} /><Route path="media" element={<MediaLibrary />} /><Route path="playground" element={<Playground />} /><Route path="models" element={<Models />} /><Route path="settings" element={<Settings />} /><Route path="logs" element={<Logs />} /><Route path="*" element={<Navigate to="/" replace />} /></Route></Routes>
