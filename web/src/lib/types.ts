@@ -17,7 +17,7 @@ export interface Account {
   last_error?: string
   note?: string
   max_concurrency: number
-  quota?: { plan?: string; weekly_used_pct?: number; extra_left?: string; checked_at?: number; error?: string }
+  quota?: { found?: boolean; plan?: string; weekly_reset?: string; weekly_used_pct?: number; extra_used_pct?: number; extra_left?: string; extra_expires?: string; checked_at?: number; error?: string }
 }
 
 export interface Task {
@@ -53,4 +53,4 @@ export interface Overview {
   browser_enabled?: boolean
   protocol?: string
 }
-export interface ServiceConfig { host: string; port: number; public_base: string; site: string; concurrency: number; queue_size: number; image_timeout: number; video_timeout: number; chat_timeout: number; media_dir: string; media_retention: string; log_level: string; credential_encryption: boolean; public_media: boolean; browser_runtime: boolean; admin_username?: string; session_ttl?: number; trust_proxy?: boolean }
+export interface ServiceConfig { host: string; port: number; public_base: string; site: string; concurrency: number; queue_size: number; image_timeout: number; video_timeout: number; chat_timeout: number; media_dir: string; media_retention: string; log_level: string; credential_encryption: boolean; public_media: boolean; browser_runtime: boolean; admin_username?: string; session_ttl?: number; trust_proxy?: boolean; max_upload_bytes?: number; ref_image_local_files?: boolean; ref_image_private_fetch?: boolean }

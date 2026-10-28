@@ -1,0 +1,8 @@
+{
+  "extName": {
+    "message": "Muse2API Cookie 导出"
+  },
+  "extDesc": {
+    "message": "读取 muse.ai 登录 Cookie，生成 Muse2API 账号池可用的 Cookie Header、JSON 或批量导入行。"
+  }
+}

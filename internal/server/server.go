@@ -436,7 +436,7 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, out any) error {
 	return nil
 }
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]any{"status": "ok", "time": time.Now().Unix(), "version": "2.0.0"})
+	writeJSON(w, 200, map[string]any{"status": "ok", "time": time.Now().Unix(), "version": "2.1.0"})
 }
 
 type browserStatus interface {
@@ -507,20 +507,27 @@ func (s *Server) processTask(ctx context.Context, t model.Task) (task.Result, er
 	}
 	switch t.Kind {
 	case "image":
-		res, err := s.driver.GenerateImage(ctx, protocol.ImageRequest{Prompt: t.APIPrompt, Model: t.Model, Size: t.Size, AspectRatio: t.AspectRatio, ResponseFormat: t.ResponseFormat, ReferenceImage: t.ReferenceImage, AccountID: lease.Account.ID})
+		res, err := s.driver.GenerateImage(ctx, protocol.ImageRequest{Prompt: t.APIPrompt, Model: t.Model, Size: t.Size, AspectRatio: t.AspectRatio, ResponseFormat: t.ResponseFormat, ReferenceImage: t.ReferenceImage, ReferenceImages: t.ReferenceImages, AccountID: lease.Account.ID})
 		if err != nil {
 			return task.Result{}, err
 		}
 		return task.Result{MediaURL: res.URL, Data: map[string]any{"filename": res.Filename, "kind": res.Kind, "bytes": res.Bytes, "url": res.URL}}, nil
 	case "video":
-		created, err := s.driver.CreateVideo(ctx, protocol.VideoRequest{Prompt: t.APIPrompt, Model: t.Model, Size: t.Size, AspectRatio: t.AspectRatio, Resolution: t.Resolution, ReferenceImage: t.ReferenceImage, Duration: t.Duration, AccountID: lease.Account.ID})
+		created, err := s.driver.CreateVideo(ctx, protocol.VideoRequest{Prompt: t.APIPrompt, Model: t.Model, Size: t.Size, AspectRatio: t.AspectRatio, Resolution: t.Resolution, ReferenceImage: t.ReferenceImage, ReferenceImages: t.ReferenceImages, Duration: t.Duration, AccountID: lease.Account.ID})
 		if err != nil {
 			return task.Result{}, err
 		}
 		if created.Status != "succeeded" && created.Status != "completed" {
 			return task.Result{}, errors.New("上游任务尚未成功，不能标记完成")
 		}
-		return task.Result{MediaURL: created.URL, Data: map[string]any{"url": created.URL}}, nil
+		data := map[string]any{"url": created.URL}
+		if created.DurationMS > 0 {
+			data["duration_ms"] = created.DurationMS
+		}
+		if created.Width > 0 && created.Height > 0 {
+			data["width"], data["height"] = created.Width, created.Height
+		}
+		return task.Result{MediaURL: created.URL, Data: data}, nil
 	default:
 		return task.Result{}, errors.New("不支持的任务类型")
 	}

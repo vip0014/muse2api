@@ -1,0 +1,8 @@
+{
+  "extName": {
+    "message": "Muse2API Cookie Exporter"
+  },
+  "extDesc": {
+    "message": "Export your signed-in Muse cookies as a Cookie Header, JSON, or batch import lines for Muse2API."
+  }
+}

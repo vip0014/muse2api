@@ -106,12 +106,16 @@ func (m *Manager) run(id string) {
 				t.Status = model.TaskFailed
 				t.Error = safeError(runErr)
 			}
+			t.ReferenceImage = ""
+			t.ReferenceImages = nil
 			return nil
 		}
 		t.Status = model.TaskSucceeded
 		t.Progress = 100
 		t.URL = result.MediaURL
 		t.Result = result.Data
+		t.ReferenceImage = ""
+		t.ReferenceImages = nil
 		return nil
 	})
 	if updateErr != nil {

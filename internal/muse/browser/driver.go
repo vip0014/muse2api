@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
@@ -186,13 +185,13 @@ func (d *Driver) GenerateImage(ctx context.Context, request protocol.ImageReques
 		return nil, err
 	}
 	prompt := buildImagePrompt(request)
-	result, updated, err := d.engine.Generate(ctx, credentials, prompt, "image", request.ReferenceImage)
+	result, updated, err := d.engine.Generate(ctx, credentials, prompt, "image", referenceList(request.ReferenceImage, request.ReferenceImages))
 	d.persist(request.AccountID, updated, err)
 	return result, err
 }
 
 func (d *Driver) EditImage(ctx context.Context, request protocol.ImageRequest) (*protocol.ImageResult, error) {
-	if strings.TrimSpace(request.ReferenceImage) == "" {
+	if len(referenceList(request.ReferenceImage, request.ReferenceImages)) == 0 {
 		return nil, errors.New("图像编辑需要参考图片")
 	}
 	return d.GenerateImage(ctx, request)
@@ -204,12 +203,12 @@ func (d *Driver) CreateVideo(ctx context.Context, request protocol.VideoRequest)
 		return nil, err
 	}
 	prompt := buildVideoPrompt(request)
-	result, updated, err := d.engine.Generate(ctx, credentials, prompt, "video", request.ReferenceImage)
+	result, updated, err := d.engine.Generate(ctx, credentials, prompt, "video", referenceList(request.ReferenceImage, request.ReferenceImages))
 	d.persist(request.AccountID, updated, err)
 	if err != nil {
 		return nil, err
 	}
-	return &protocol.VideoTask{ID: result.Filename, Status: "succeeded", Progress: 100, URL: result.URL}, nil
+	return &protocol.VideoTask{ID: result.Filename, Status: "succeeded", Progress: 100, URL: result.URL, DurationMS: result.DurationMS, Width: result.Width, Height: result.Height}, nil
 }
 
 func (d *Driver) GetVideoTask(context.Context, string) (*protocol.VideoTask, error) {

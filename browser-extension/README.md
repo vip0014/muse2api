@@ -4,21 +4,17 @@
 
 ## 下载
 
-直接下载打包好的 ZIP：
-
-<https://github.com/vip0014/muse2api/releases/download/browser-extension-v1.0.0/muse2api-cookie-exporter-1.0.0.zip>
-
-SHA-256：`25772e0ff5cee98b255463fa8e43d953b03554b25b84c5941dcb53e5b5770563`
+源码版本是 1.0.1，包含中英文 `_locales`。可以直接加载本目录，或从 [GitHub Releases](https://github.com/vip0014/muse2api/releases) 下载最新 ZIP。
 
 解压后得到 `muse2api-cookie-exporter/` 目录，再按下面的“安装”步骤加载。
 
 ## 功能
 
 - 读取 `muse.ai` 及子域下的登录 Cookie
-- 检查三个核心凭据是否齐全：
+- 检查两个必要凭据是否齐全：
   - `hatch_sess`
   - `hatch_vml`
-  - `hatch_native_auth_device`
+- `hatch_native_auth_device` 是可选设备标识，存在时会一起导出，但不再是必填项
 - 支持三种导出格式：
   - **Cookie Header**：`name=value; name2=value2`，直接粘贴到“账号池 → 添加账号”
   - **JSON**：`{"name":"value"}`，同样可以粘贴到同一个输入框
@@ -42,7 +38,7 @@ SHA-256：`25772e0ff5cee98b255463fa8e43d953b03554b25b84c5941dcb53e5b5770563`
 5. 打开 Muse2API 后台 → 账号池 → 添加账号，粘贴到“Cookie Header 或 JSON”输入框
 6. 保存后点“检测”，确认会话有效
 
-如果显示“缺少核心项”，通常是没有真正登录、登录已过期，或者浏览器拦截了第三方 Cookie。重新登录 Muse 后再点“重新读取”。
+如果显示“缺少必要项”，通常是没有真正登录、登录已过期，或者浏览器拦截了第三方 Cookie。重新登录 Muse 后再点“重新读取”。
 
 ## 安全说明
 

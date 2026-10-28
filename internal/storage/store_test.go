@@ -283,3 +283,24 @@ func contains(s, sub string) bool {
 	}
 	return false
 }
+
+func TestEssentialCookiesDoNotRequireDeviceCookie(t *testing.T) {
+	s, err := Open(t.TempDir(), testKey(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	two, err := s.AddAccount("two", map[string]string{"hatch_sess": "s", "hatch_vml": "v"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !two.EssentialOK {
+		t.Fatal("sess + vml should be enough")
+	}
+	one, err := s.AddAccount("one", map[string]string{"hatch_sess": "s"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if one.EssentialOK {
+		t.Fatal("sess without vml should not be essential-complete")
+	}
+}

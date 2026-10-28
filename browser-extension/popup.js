@@ -1,4 +1,4 @@
-const ESSENTIAL = ['hatch_sess', 'hatch_vml', 'hatch_native_auth_device'];
+const ESSENTIAL = ['hatch_sess', 'hatch_vml'];
 const SITE = 'https://muse.ai';
 
 const state = {
@@ -57,10 +57,10 @@ function renderStatus() {
   const names = new Set(state.cookies.map(cookie => cookie.name));
   const missing = ESSENTIAL.filter(name => !names.has(name));
   if (missing.length > 0) {
-    setStatus('warn', `${state.cookies.length} 条 Cookie，缺少核心项：${missing.join('、')}`);
+    setStatus('warn', `${state.cookies.length} 条 Cookie，缺少必要项：${missing.join('、')}`);
     return;
   }
-  setStatus('ok', `${state.cookies.length} 条 Cookie，核心凭据完整。`);
+  setStatus('ok', `${state.cookies.length} 条 Cookie，必要凭据完整。`);
 }
 
 function renderOutput() {

@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"mime"
 	"net/http"
 	"os"
@@ -363,48 +362,52 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 func mustJSON(v string) json.RawMessage { b, _ := json.Marshal(v); return b }
 
 type imageAPIRequest struct {
-	Prompt         string          `json:"prompt"`
-	Model          string          `json:"model"`
-	N              int             `json:"n"`
-	Size           string          `json:"size"`
-	AspectRatio    string          `json:"aspect_ratio"`
-	ResponseFormat string          `json:"response_format"`
-	Timeout        int             `json:"timeout"`
-	Extra          string          `json:"extra"`
-	Image          json.RawMessage `json:"image"`
-	Images         json.RawMessage `json:"images"`
-	ReferenceImage string          `json:"reference_image"`
-	Async          bool            `json:"async"`
+	Prompt          string          `json:"prompt"`
+	Model           string          `json:"model"`
+	N               int             `json:"n"`
+	Size            string          `json:"size"`
+	AspectRatio     string          `json:"aspect_ratio"`
+	ResponseFormat  string          `json:"response_format"`
+	Timeout         int             `json:"timeout"`
+	Extra           string          `json:"extra"`
+	Image           json.RawMessage `json:"image"`
+	Images          json.RawMessage `json:"images"`
+	ReferenceImage  string          `json:"reference_image"`
+	ReferenceImages []string        `json:"-"`
+	Async           bool            `json:"async"`
 }
 
 func (r imageAPIRequest) reference() string {
+	if len(r.ReferenceImages) > 0 {
+		return r.ReferenceImages[0]
+	}
 	if r.ReferenceImage != "" {
 		return r.ReferenceImage
 	}
 	return rawReference(r.Image)
 }
 func rawReference(raw json.RawMessage) string {
-	if len(raw) == 0 {
+	if len(raw) == 0 || string(raw) == "null" {
 		return ""
 	}
 	var text string
 	if json.Unmarshal(raw, &text) == nil {
-		return text
+		return strings.TrimSpace(text)
 	}
 	var obj struct {
-		URL      string `json:"url"`
-		B64      string `json:"b64_json"`
-		ImageURL string `json:"image_url"`
+		URL      json.RawMessage `json:"url"`
+		B64      string          `json:"b64_json"`
+		ImageURL json.RawMessage `json:"image_url"`
 	}
 	if json.Unmarshal(raw, &obj) == nil {
-		if obj.URL != "" {
-			return obj.URL
+		if value := rawReference(obj.ImageURL); value != "" {
+			return value
 		}
-		if obj.ImageURL != "" {
-			return obj.ImageURL
+		if value := rawReference(obj.URL); value != "" {
+			return value
 		}
-		if obj.B64 != "" {
-			return "data:image/png;base64," + obj.B64
+		if strings.TrimSpace(obj.B64) != "" {
+			return "data:image/png;base64," + strings.TrimSpace(obj.B64)
 		}
 	}
 	return ""
@@ -439,7 +442,8 @@ func (s *Server) generateImageSync(w http.ResponseWriter, r *http.Request, req i
 	defer lease.Release()
 	request := protocol.ImageRequest{
 		Prompt: req.Prompt, Model: resolveModel(req.Model, "muse-image"),
-		Size: req.Size, AspectRatio: req.AspectRatio, ReferenceImage: req.reference(),
+		Size: req.Size, AspectRatio: req.AspectRatio,
+		ReferenceImage: req.reference(), ReferenceImages: req.ReferenceImages,
 		ResponseFormat: req.ResponseFormat, AccountID: lease.Account.ID,
 	}
 	var res *protocol.ImageResult
@@ -470,6 +474,17 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, r, err)
 		return
 	}
+	rawRefs, err := parseImageReferences(req)
+	if err != nil {
+		apierr.Write(w, r, err)
+		return
+	}
+	refs, err := s.prepareReferences(r.Context(), rawRefs)
+	if err != nil {
+		apierr.Write(w, r, err)
+		return
+	}
+	req.ReferenceImages = refs
 	if req.Async {
 		s.queueImage(w, r, req)
 		return
@@ -478,6 +493,7 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) imageEdits(w http.ResponseWriter, r *http.Request) {
 	req := imageAPIRequest{Prompt: "参考此图片并进行生图创作", ResponseFormat: "url"}
+	var rawRefs []string
 	if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data") {
 		if err := r.ParseMultipartForm(s.cfg.MaxUploadBytes); err != nil {
 			apierr.Write(w, r, apierr.BadRequest("multipart 请求无效或过大"))
@@ -489,30 +505,21 @@ func (s *Server) imageEdits(w http.ResponseWriter, r *http.Request) {
 		req.AspectRatio = r.FormValue("aspect_ratio")
 		req.ResponseFormat = r.FormValue("response_format")
 		req.Async = r.FormValue("async") == "true" || r.FormValue("async") == "1"
-		file, header, err := r.FormFile("image")
+		var err error
+		rawRefs, err = s.multipartReferences(r)
 		if err != nil {
-			apierr.Write(w, r, apierr.BadRequest("缺少参考图片"))
+			apierr.Write(w, r, err)
 			return
 		}
-		defer file.Close()
-		if header.Size > s.cfg.MaxUploadBytes {
-			apierr.Write(w, r, apierr.New(413, "invalid_request_error", "参考图片过大"))
-			return
-		}
-		data, err := io.ReadAll(io.LimitReader(file, s.cfg.MaxUploadBytes+1))
-		if err != nil || int64(len(data)) > s.cfg.MaxUploadBytes {
-			apierr.Write(w, r, apierr.New(413, "invalid_request_error", "参考图片过大"))
-			return
-		}
-		contentType := header.Header.Get("Content-Type")
-		if !strings.HasPrefix(contentType, "image/") {
-			apierr.Write(w, r, apierr.BadRequest("仅支持图片参考文件"))
-			return
-		}
-		req.ReferenceImage = "data:" + contentType + ";base64," + base64.StdEncoding.EncodeToString(data)
 	} else {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			apierr.Write(w, r, apierr.BadRequest("请求 JSON 无效"))
+			return
+		}
+		var err error
+		rawRefs, err = parseImageReferences(req)
+		if err != nil {
+			apierr.Write(w, r, err)
 			return
 		}
 	}
@@ -523,10 +530,16 @@ func (s *Server) imageEdits(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, r, err)
 		return
 	}
-	if req.reference() == "" {
+	refs, err := s.prepareReferences(r.Context(), rawRefs)
+	if err != nil {
+		apierr.Write(w, r, err)
+		return
+	}
+	if len(refs) == 0 {
 		apierr.Write(w, r, apierr.BadRequest("图像编辑需要参考图片"))
 		return
 	}
+	req.ReferenceImages = refs
 	if req.Async {
 		s.queueImage(w, r, req)
 		return
@@ -543,6 +556,17 @@ func (s *Server) imageTasks(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, r, err)
 		return
 	}
+	rawRefs, err := parseImageReferences(req)
+	if err != nil {
+		apierr.Write(w, r, err)
+		return
+	}
+	refs, err := s.prepareReferences(r.Context(), rawRefs)
+	if err != nil {
+		apierr.Write(w, r, err)
+		return
+	}
+	req.ReferenceImages = refs
 	s.queueImage(w, r, req)
 }
 func (s *Server) queueImage(w http.ResponseWriter, r *http.Request, req imageAPIRequest) {
@@ -557,15 +581,15 @@ func (s *Server) queueImage(w http.ResponseWriter, r *http.Request, req imageAPI
 		keyHash = hex.EncodeToString(sum[:])
 	}
 	payload, _ := json.Marshal(struct {
-		Req imageAPIRequest `json:"request"`
-		Ref string          `json:"reference"`
-	}{req, req.reference()})
+		Req        imageAPIRequest `json:"request"`
+		References []string        `json:"references"`
+	}{req, req.ReferenceImages})
 	sum := sha256.Sum256(payload)
 	hash := hex.EncodeToString(sum[:])
 	taskRecord, created, err := s.store.FindOrCreateTask(model.Task{
 		Kind: "image", Prompt: req.Prompt, APIPrompt: req.Prompt,
 		Model: resolveModel(req.Model, "muse-image"), Size: req.Size, AspectRatio: req.AspectRatio,
-		ReferenceImage: req.reference(), ResponseFormat: req.ResponseFormat,
+		ReferenceImage: req.reference(), ReferenceImages: req.ReferenceImages, ResponseFormat: req.ResponseFormat,
 		IdempotencyKey: keyHash, RequestHash: hash,
 	})
 	if err != nil {
@@ -643,13 +667,17 @@ func (s *Server) imageResponse(req imageAPIRequest, res *protocol.ImageResult) (
 }
 
 type videoAPIRequest struct {
-	Prompt         string `json:"prompt"`
-	Model          string `json:"model"`
-	Duration       int    `json:"duration"`
-	Size           string `json:"size"`
-	AspectRatio    string `json:"aspect_ratio"`
-	Resolution     string `json:"resolution"`
-	ReferenceImage string `json:"reference_image"`
+	Prompt          string          `json:"prompt"`
+	Model           string          `json:"model"`
+	Duration        int             `json:"duration"`
+	Size            string          `json:"size"`
+	AspectRatio     string          `json:"aspect_ratio"`
+	Resolution      string          `json:"resolution"`
+	ReferenceImage  string          `json:"reference_image"`
+	Image           json.RawMessage `json:"image"`
+	ImageURL        json.RawMessage `json:"image_url"`
+	Images          json.RawMessage `json:"images"`
+	ReferenceImages []string        `json:"-"`
 }
 
 // Muse currently exposes one roughly 10-second clip per media task and has no
@@ -663,7 +691,7 @@ func normalizeVideoDuration(duration int) (int, error) {
 	if duration <= 10 {
 		return duration, nil
 	}
-	return 0, apierr.BadRequest("当前版本只生成单片段，官网单片段约 10 秒；多片段/最长约 60 秒尚未实现")
+	return 0, apierr.BadRequest("本项目只生成单片段（约 10 秒）；更长视频请分段生成")
 }
 
 func (s *Server) createVideo(w http.ResponseWriter, r *http.Request) {
@@ -678,6 +706,17 @@ func (s *Server) createVideo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.Duration = normalizedDuration
+	rawRefs, err := parseVideoReferences(req)
+	if err != nil {
+		apierr.Write(w, r, err)
+		return
+	}
+	refs, err := s.prepareReferences(r.Context(), rawRefs)
+	if err != nil {
+		apierr.Write(w, r, err)
+		return
+	}
+	req.ReferenceImages = refs
 	idempotencyKey := r.Header.Get("Idempotency-Key")
 	if len(idempotencyKey) > 256 {
 		apierr.Write(w, r, apierr.BadRequest("Idempotency-Key 过长"))
@@ -690,7 +729,10 @@ func (s *Server) createVideo(w http.ResponseWriter, r *http.Request) {
 		sum := sha256.Sum256([]byte("video:" + idempotencyKey))
 		keyHash = hex.EncodeToString(sum[:])
 	}
-	payload, err := json.Marshal(req)
+	payload, err := json.Marshal(struct {
+		Req        videoAPIRequest `json:"request"`
+		References []string        `json:"references"`
+	}{req, req.ReferenceImages})
 	if err != nil {
 		apierr.Write(w, r, apierr.BadRequest("视频请求无法规范化"))
 		return
@@ -701,7 +743,7 @@ func (s *Server) createVideo(w http.ResponseWriter, r *http.Request) {
 		Kind: "video", Prompt: req.Prompt, APIPrompt: req.Prompt,
 		Model: resolveModel(req.Model, "muse-video"), Duration: req.Duration,
 		Size: req.Size, AspectRatio: req.AspectRatio, Resolution: req.Resolution,
-		ReferenceImage: req.ReferenceImage,
+		ReferenceImage: firstReference(req.ReferenceImages...), ReferenceImages: req.ReferenceImages,
 		IdempotencyKey: keyHash, RequestHash: requestHash,
 	})
 	if err != nil {
@@ -772,6 +814,10 @@ func mapDriverError(err error) error {
 	}
 	if errors.Is(err, protocol.ErrSessionExpired) {
 		return apierr.New(401, "auth_error", "上游 Session 已失效")
+	}
+	var refusal *protocol.ModelRefusalError
+	if errors.As(err, &refusal) {
+		return apierr.New(http.StatusBadGateway, "upstream_refusal", "上游拒绝生成媒体："+refusal.Message)
 	}
 	var up *protocol.UpstreamError
 	if errors.As(err, &up) {

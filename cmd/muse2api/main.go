@@ -77,7 +77,7 @@ func main() {
 			}
 		}
 	}()
-	logger.Info("Muse2API 已启动", "address", cfg.Address(), "version", "2.0.0", "generation_protocol", generationProtocol, "browser_enabled", cfg.BrowserEnabled)
+	logger.Info("Muse2API 已启动", "address", cfg.Address(), "version", "2.1.0", "generation_protocol", generationProtocol, "browser_enabled", cfg.BrowserEnabled)
 	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		logger.Error("服务退出", "error", err)
 		os.Exit(1)

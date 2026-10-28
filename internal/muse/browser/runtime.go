@@ -291,7 +291,7 @@ func (p *Page) applyCookies(ctx context.Context, credentials protocol.AccountCre
 		if exp := credentials.CookieExpiry[name]; exp > now.Add(time.Hour).Unix() {
 			expires = exp
 		}
-		essential := name == "hatch_sess" || name == "hatch_vml" || name == "hatch_native_auth_device"
+		essential := name == "hatch_sess" || name == "hatch_vml"
 		params := map[string]any{"name": name, "value": value, "path": "/", "secure": u.Scheme == "https", "expires": expires}
 		hostname := strings.TrimPrefix(u.Hostname(), ".")
 		if strings.HasPrefix(name, "__Host-") || hostname == "localhost" || net.ParseIP(hostname) != nil {

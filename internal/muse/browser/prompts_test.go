@@ -30,3 +30,17 @@ func TestBuildVideoPromptDefaultsAndShape(t *testing.T) {
 		t.Fatalf("unexpected explicit-duration prompt: %s", explicit)
 	}
 }
+
+func TestBuildImagePromptMultipleReferences(t *testing.T) {
+	prompt := buildImagePrompt(protocol.ImageRequest{Prompt: "海报", ReferenceImages: []string{"a", "b"}})
+	if !strings.Contains(prompt, "2 张") {
+		t.Fatalf("multi-image prompt missing count: %s", prompt)
+	}
+}
+
+func TestBuildVideoPromptMultipleReferences(t *testing.T) {
+	prompt := buildVideoPrompt(protocol.VideoRequest{Prompt: "运动", ReferenceImages: []string{"a", "b"}})
+	if !strings.Contains(prompt, "第一张") || !strings.Contains(prompt, "2 张") {
+		t.Fatalf("multi-video prompt missing first-frame instruction: %s", prompt)
+	}
+}

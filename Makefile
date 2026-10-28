@@ -1,4 +1,4 @@
-.PHONY: dev build test race lint bench init-data backup docker
+.PHONY: dev build test race lint init-data backup docker
 
 dev:
 	go run ./cmd/muse2api
@@ -20,9 +20,6 @@ race:
 lint:
 	go vet ./internal/... ./cmd/...
 	cd web && npm run lint
-
-bench:
-	go test ./internal/storage -run '^$$' -bench . -benchmem
 
 init-data:
 	sh deploy/init-data.sh

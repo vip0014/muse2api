@@ -10,6 +10,19 @@ import (
 
 var ErrCapabilityUnavailable = errors.New("capability unavailable")
 var ErrSessionExpired = errors.New("session expired")
+var ErrModelRefusal = errors.New("model refused media generation")
+
+// ModelRefusalError means Muse completed the turn with text instead of media.
+// The original text is preserved so callers can see region/availability
+// refusals instead of a generic timeout.
+type ModelRefusalError struct {
+	Message string
+}
+
+func (e *ModelRefusalError) Error() string {
+	return "模型未生成媒体，仅返回文本：" + e.Message
+}
+func (e *ModelRefusalError) Unwrap() error { return ErrModelRefusal }
 
 type ChatRequest struct {
 	Prompt    string
@@ -21,22 +34,31 @@ type ChatEvent struct {
 	Done  bool
 	Err   error
 }
-type ImageRequest struct{ Prompt, Model, Size, AspectRatio, ResponseFormat, ReferenceImage, AccountID string }
+type ImageRequest struct {
+	Prompt, Model, Size, AspectRatio, ResponseFormat, ReferenceImage, AccountID string
+	ReferenceImages                                                             []string
+}
 type ImageResult struct {
 	Filename, Kind, URL string
 	Bytes               int64
 	Data                []byte
+	DurationMS          int
+	Width, Height       int
 }
 type VideoRequest struct {
 	Prompt, Model, Size, AspectRatio, Resolution, ReferenceImage, AccountID string
+	ReferenceImages                                                         []string
 	Duration                                                                int
 }
 type VideoTask struct {
-	ID       string
-	Status   string
-	Progress int
-	URL      string
-	Error    string
+	ID         string
+	Status     string
+	Progress   int
+	URL        string
+	Error      string
+	DurationMS int
+	Width      int
+	Height     int
 }
 type Session struct {
 	Valid                 bool

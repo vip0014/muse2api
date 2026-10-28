@@ -16,6 +16,7 @@ type chatState struct {
 	Total int    `json:"total"`
 	Text  string `json:"txt"`
 	Stop  bool   `json:"stop"`
+	Path  string `json:"path"`
 }
 
 const pollChatJS = `(function(){
@@ -31,7 +32,7 @@ const pollChatJS = `(function(){
 	var stop=!!(document.querySelector('[data-testid="hatch-composer-stop-button"]')
 		||document.querySelector('button[aria-label*="Stop" i]')
 		||document.querySelector('button[aria-label*="停止"]'));
-	return JSON.stringify({cnt:nonEmpty.length,total:bs.length,txt:txt,stop:stop});
+	return JSON.stringify({cnt:nonEmpty.length,total:bs.length,txt:txt,stop:stop,path:location.pathname||''});
 })()`
 
 const (

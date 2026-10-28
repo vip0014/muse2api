@@ -425,9 +425,12 @@ func (s *Store) ListTasks(limit int) []model.Task {
 		out = out[:limit]
 	}
 	// Deep-copy only the rows that leave the store. A dashboard asking for
-	// 20 rows must not serialize every historical task result.
+	// 20 rows must not serialize every historical task result, and list views
+	// never need the (potentially tens of MiB) reference payload.
 	for i := range out {
 		out[i] = cloneTask(out[i])
+		out[i].ReferenceImage = ""
+		out[i].ReferenceImages = nil
 	}
 	return out
 }
@@ -565,7 +568,7 @@ func (s *Store) Events(limit int) []model.Event {
 func (s *Store) Close() error { return nil }
 func normalizeAccount(a *model.Account) {
 	a.CookieCount = len(a.Cookies)
-	a.EssentialOK = a.Cookies["hatch_sess"] != "" && a.Cookies["hatch_vml"] != "" && a.Cookies["hatch_native_auth_device"] != ""
+	a.EssentialOK = a.Cookies["hatch_sess"] != "" && a.Cookies["hatch_vml"] != ""
 	if a.MaxConcurrency <= 0 {
 		a.MaxConcurrency = 1
 	}
@@ -610,6 +613,9 @@ func cloneAccount(a model.Account) model.Account {
 	return a
 }
 func cloneTask(t model.Task) model.Task {
+	if t.ReferenceImages != nil {
+		t.ReferenceImages = append([]string(nil), t.ReferenceImages...)
+	}
 	if t.Result != nil {
 		out := make(map[string]any, len(t.Result))
 		for key, value := range t.Result {

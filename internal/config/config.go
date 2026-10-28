@@ -31,6 +31,8 @@ type Config struct {
 	HTTPTimeout              time.Duration
 	MaxUploadBytes           int64
 	MaxMediaBytes            int64
+	RefImageLocalFiles       bool
+	RefImagePrivateFetch     bool
 	CredentialKey            []byte
 	AllowInsecureCredentials bool
 	KeepLegacyPlaintext      bool
@@ -94,11 +96,13 @@ func Load(homeOverride string) (Config, error) {
 		CORSOrigins:              split(env("MUSE2API_CORS_ORIGINS", "")),
 		Concurrency:              2,
 		QueueSize:                64,
-		MaxUploadBytes:           16 << 20,
+		MaxUploadBytes:           40 << 20,
 		MaxMediaBytes:            512 << 20,
 		CredentialKey:            key,
 		AllowInsecureCredentials: boolEnv("MUSE2API_ALLOW_INSECURE_CREDENTIALS"),
 		KeepLegacyPlaintext:      boolEnv("MUSE2API_KEEP_LEGACY_PLAINTEXT"),
+		RefImageLocalFiles:       boolEnv("MUSE2API_REF_IMAGE_LOCAL_FILES"),
+		RefImagePrivateFetch:     boolEnv("MUSE2API_REF_IMAGE_PRIVATE_FETCH"),
 		AdminUsername:            strings.TrimSpace(env("MUSE2API_ADMIN_USERNAME", "admin")),
 		AdminPassword:            adminPassword,
 		TrustProxy:               boolEnv("MUSE2API_TRUST_PROXY"),
@@ -146,7 +150,7 @@ func Load(homeOverride string) (Config, error) {
 		return Config{}, err
 	}
 	c.SessionTTL = time.Duration(ttlSeconds) * time.Second
-	if c.MaxUploadBytes, err = int64Env("MUSE2API_MAX_UPLOAD_BYTES", 16<<20, 1024, 1<<30); err != nil {
+	if c.MaxUploadBytes, err = int64Env("MUSE2API_MAX_UPLOAD_BYTES", 40<<20, 1024, 1<<30); err != nil {
 		return Config{}, err
 	}
 	if c.MaxMediaBytes, err = int64Env("MUSE2API_MAX_MEDIA_BYTES", 512<<20, 1024, 20<<30); err != nil {

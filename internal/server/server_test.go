@@ -1,13 +1,17 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/textproto"
 	"os"
 	"path/filepath"
 	"strings"
@@ -64,7 +68,7 @@ func testServer(t *testing.T, driver protocol.Driver) (*Server, http.Handler) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	account, err := store.AddAccount("test", map[string]string{"hatch_sess": "s", "hatch_vml": "v", "hatch_native_auth_device": "d"}, nil)
+	account, err := store.AddAccount("test", map[string]string{"hatch_sess": "s", "hatch_vml": "v"}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -291,17 +295,26 @@ type recordingDriver struct {
 	imageAccount string
 	editAccount  string
 	editSize     string
+	imageRefs    []string
+	editRefs     []string
+	videoRefs    []string
 	session      *protocol.Session
 }
 
 func (d *recordingDriver) GenerateImage(_ context.Context, req protocol.ImageRequest) (*protocol.ImageResult, error) {
 	d.imageAccount = req.AccountID
+	d.imageRefs = append([]string(nil), req.ReferenceImages...)
 	return &protocol.ImageResult{Filename: "x.png", Kind: "image", URL: "/v1/media/x.png", Bytes: 1}, nil
 }
 func (d *recordingDriver) EditImage(_ context.Context, req protocol.ImageRequest) (*protocol.ImageResult, error) {
 	d.editAccount = req.AccountID
 	d.editSize = req.Size
+	d.editRefs = append([]string(nil), req.ReferenceImages...)
 	return &protocol.ImageResult{Filename: "x.png", Kind: "image", URL: "/v1/media/x.png", Bytes: 1}, nil
+}
+func (d *recordingDriver) CreateVideo(_ context.Context, req protocol.VideoRequest) (*protocol.VideoTask, error) {
+	d.videoRefs = append([]string(nil), req.ReferenceImages...)
+	return &protocol.VideoTask{ID: "video-1", Status: "succeeded", Progress: 100, URL: "/v1/media/video-1.mp4"}, nil
 }
 func (d *recordingDriver) CheckSession(context.Context, protocol.AccountCredentials) (*protocol.Session, error) {
 	if d.session != nil {
@@ -381,10 +394,14 @@ func TestUnknownAPIPathReturnsJSON404(t *testing.T) {
 func TestOverviewDoesNotLeakReferenceImage(t *testing.T) {
 	s, h := testServer(t, &fakeDriver{})
 	task, _ := s.store.CreateTask("image", "p", "p", "", "")
-	_, _ = s.store.UpdateTask(task.ID, func(t *model.Task) error { t.ReferenceImage = "data:image/png;base64,SUPERSECRET"; return nil })
+	_, _ = s.store.UpdateTask(task.ID, func(t *model.Task) error {
+		t.ReferenceImage = "data:image/png;base64,SUPERSECRET"
+		t.ReferenceImages = []string{"SUPERSECRET2"}
+		return nil
+	})
 	cookie := adminLogin(t, h)
 	rec := adminRequest(h, "GET", "/admin/overview", "", cookie)
-	if strings.Contains(rec.Body.String(), "SUPERSECRET") {
+	if strings.Contains(rec.Body.String(), "SUPERSECRET") || strings.Contains(rec.Body.String(), "SUPERSECRET2") {
 		t.Fatalf("overview leaked reference image: %s", rec.Body.String())
 	}
 }
@@ -516,4 +533,100 @@ func TestImportAutoChecksAndRefreshesQuota(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("imported account was not auto-checked and refreshed")
+}
+
+const tinyImageBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+
+func tinyImageURL() string { return "data:image/png;base64," + tinyImageBase64 }
+
+func TestImageGenerationAcceptsOrderedReferences(t *testing.T) {
+	driver := &recordingDriver{}
+	_, h := testServer(t, driver)
+	body := fmt.Sprintf(`{"prompt":"x","images":[{"url":%q},{"url":%q}]}`, tinyImageURL(), tinyImageURL())
+	rec := request(h, "POST", "/v1/images/generations", body, "test-secret")
+	if rec.Code != 200 || len(driver.imageRefs) != 2 {
+		t.Fatalf("status=%d refs=%d body=%s", rec.Code, len(driver.imageRefs), rec.Body.String())
+	}
+	for _, ref := range driver.imageRefs {
+		if !strings.HasPrefix(ref, "data:image/png;base64,") {
+			t.Fatalf("unexpected normalized reference: %s", ref)
+		}
+	}
+}
+
+func TestImageGenerationRejectsTooManyAndMixedReferences(t *testing.T) {
+	driver := &recordingDriver{}
+	_, h := testServer(t, driver)
+	ref := tinyImageURL()
+	tooMany := fmt.Sprintf(`{"prompt":"x","images":[%q,%q,%q,%q,%q]}`, ref, ref, ref, ref, ref)
+	if rec := request(h, "POST", "/v1/images/generations", tooMany, "test-secret"); rec.Code != 400 {
+		t.Fatalf("too many status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	mixed := fmt.Sprintf(`{"prompt":"x","reference_image":%q,"images":[%q]}`, ref, ref)
+	if rec := request(h, "POST", "/v1/images/generations", mixed, "test-secret"); rec.Code != 400 {
+		t.Fatalf("mixed status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestImageEditsAcceptsMultipleMultipartImages(t *testing.T) {
+	driver := &recordingDriver{}
+	_, h := testServer(t, driver)
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	if err := writer.WriteField("prompt", "combine"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		header := textproto.MIMEHeader{}
+		header.Set("Content-Disposition", fmt.Sprintf(`form-data; name="image"; filename="ref-%d.png"`, i))
+		header.Set("Content-Type", "image/png")
+		part, err := writer.CreatePart(header)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := part.Write([]byte("png-content")); err != nil {
+			t.Fatal(err)
+		}
+
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest("POST", "/v1/images/edits", &buf)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Authorization", "Bearer test-secret")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 || len(driver.editRefs) != 2 {
+		t.Fatalf("status=%d refs=%d body=%s", rec.Code, len(driver.editRefs), rec.Body.String())
+	}
+}
+
+func TestVideoAcceptsOrderedReferences(t *testing.T) {
+	driver := &recordingDriver{}
+	_, h := testServer(t, driver)
+	ref := tinyImageURL()
+	body := fmt.Sprintf(`{"prompt":"move","images":[{"url":%q},{"url":%q}]}`, ref, ref)
+	rec := request(h, "POST", "/v1/videos", body, "test-secret")
+	if rec.Code != 202 {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for len(driver.videoRefs) != 2 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(driver.videoRefs) != 2 {
+		t.Fatalf("video refs=%d body=%s", len(driver.videoRefs), rec.Body.String())
+	}
+}
+
+func TestImageTaskRejectsBadReferenceBeforeQueue(t *testing.T) {
+	s, h := testServer(t, &recordingDriver{})
+	rec := request(h, "POST", "/v1/images/tasks", `{"prompt":"x","images":["http://127.0.0.1:1/x.png"]}`, "test-secret")
+	if rec.Code != 400 {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if tasks := s.store.ListTasks(1); len(tasks) != 0 {
+		t.Fatalf("task created before reference validation: %+v", tasks)
+	}
 }

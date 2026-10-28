@@ -10,10 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"mime"
-	"net"
-	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -22,6 +18,7 @@ import (
 	"time"
 
 	"muse2api/internal/muse/protocol"
+	"muse2api/internal/refimage"
 )
 
 type attachment struct {
@@ -70,133 +67,90 @@ func (p *Page) clearAttachments(ctx context.Context) {
 	time.Sleep(300 * time.Millisecond)
 }
 
-func normalizeReference(ctx context.Context, raw string) ([]byte, string, error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return nil, "", nil
-	}
-	if len(raw) > (16<<20)*4/3+1024 {
-		return nil, "", errors.New("参考图超过 16 MiB")
-	}
-	if strings.HasPrefix(raw, "data:") {
-		parts := strings.SplitN(raw, ",", 2)
-		if len(parts) != 2 {
-			return nil, "", errors.New("参考图 data URL 无效")
-		}
-		mimeType := "image/png"
-		if semicolon := strings.IndexByte(parts[0], ';'); semicolon >= 0 {
-			mimeType = strings.TrimPrefix(parts[0][:semicolon], "data:")
-		}
-		data, err := base64.StdEncoding.DecodeString(parts[1])
-		return data, mimeType, err
-	}
-	if strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://") {
-		return fetchReference(ctx, raw)
-	}
-	data, err := base64.StdEncoding.DecodeString(raw)
+func (p *Page) composerAttachmentCount(ctx context.Context) (int, error) {
+	var raw string
+	err := p.conn.JS(ctx, `(function(){
+		var ov = document.querySelector('[data-testid="hatch-composer-placeholder-overlay"]');
+		var composer = ov ? (ov.closest('form') || ov.parentElement.parentElement.parentElement) : null;
+		if (!composer) return 0;
+		var remove = Array.from(composer.querySelectorAll('button[aria-label]')).filter(function(b){
+			return /remove\s*attachment|移除附件|删除附件/i.test(b.getAttribute('aria-label') || '');
+		}).length;
+		if (remove) return remove;
+		return composer.querySelectorAll('img, video').length;
+	})()`, false, &raw)
 	if err != nil {
-		return nil, "", errors.New("参考图必须为 data URL、base64 或 http(s) URL")
+		return 0, err
 	}
-	if len(data) > 16<<20 {
-		return nil, "", errors.New("参考图超过 16 MiB")
+	var count int
+	if err := json.Unmarshal([]byte(raw), &count); err != nil {
+		return 0, err
 	}
-	return data, "image/png", nil
+	return count, nil
 }
 
-func fetchReference(ctx context.Context, raw string) ([]byte, string, error) {
-	u, err := url.Parse(raw)
-	if err != nil || u.User != nil {
-		return nil, "", errors.New("参考图 URL 无效")
+func (p *Page) attachImages(ctx context.Context, references []string) error {
+	if len(references) == 0 {
+		return nil
 	}
-	transport := &http.Transport{Proxy: nil}
-	defer transport.CloseIdleConnections()
-	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
-		host, port, err := net.SplitHostPort(address)
+	if len(references) > refimage.MaxImages {
+		return refimage.ErrTooManyImages
+	}
+	p.clearAttachments(ctx)
+	totalBytes := 0
+	for index, raw := range references {
+		data, mimeType, err := refimage.DecodeDataURL(raw)
 		if err != nil {
-			return nil, err
+			return fmt.Errorf("第 %d 张参考图：%w", index+1, err)
 		}
-		ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
-		if err != nil {
-			return nil, err
+		totalBytes += len(data)
+		if totalBytes > refimage.MaxTotalBytes {
+			return refimage.ErrTotalTooLarge
 		}
-		var chosen net.IP
-		for _, ip := range ips {
-			if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast() {
-				return nil, errors.New("参考图 URL 指向受限制网络")
+		parts := strings.SplitN(strings.ToLower(mimeType), "/", 2)
+		ext := "png"
+		if len(parts) == 2 && parts[1] != "" {
+			ext = strings.TrimPrefix(parts[1], "x-")
+		}
+		if ext == "jpeg" {
+			ext = "jpg"
+		}
+		name := fmt.Sprintf("reference_image_%d.%s", index+1, ext)
+		encoded := base64.StdEncoding.EncodeToString(data)
+		expression := `(function(b64,mime,name){try{var chars=atob(b64);var nums=new Array(chars.length);for(var i=0;i<chars.length;i++)nums[i]=chars.charCodeAt(i);var blob=new Blob([new Uint8Array(nums)],{type:mime});var file=new File([blob],name,{type:mime});var inputs=Array.from(document.querySelectorAll('input[type="file"]'));if(!inputs.length)return JSON.stringify({ok:false,err:'no-file-input'});var ov=document.querySelector('[data-testid="hatch-composer-placeholder-overlay"]');var composer=ov?ov.closest('form'):null;var input=composer?inputs.find(function(x){return composer.contains(x);}):null;if(!input)input=inputs.find(function(x){return !x.closest('[class*=chat-user-bubble], [class*="group/msg"]');})||inputs[0];if(!input.getAttribute('accept'))input.setAttribute('accept','image/*');var dt=new DataTransfer();dt.items.add(file);input.files=dt.files;input.dispatchEvent(new Event('change',{bubbles:true}));input.dispatchEvent(new Event('input',{bubbles:true}));return JSON.stringify({ok:true});}catch(e){return JSON.stringify({ok:false,err:String(e)});}})(` + jsString(encoded) + `,` + jsString(mimeType) + `,` + jsString(name) + `)`
+		var rawResult string
+		if err := p.conn.JS(ctx, expression, false, &rawResult); err != nil {
+			return fmt.Errorf("第 %d 张参考图附加失败：%w", index+1, err)
+		}
+		var result struct {
+			OK bool `json:"ok"`
+		}
+		if err := json.Unmarshal([]byte(rawResult), &result); err != nil || !result.OK {
+			return fmt.Errorf("第 %d 张参考图附加失败，已停止生成", index+1)
+		}
+		deadline := time.Now().Add(15 * time.Second)
+		for {
+			count, err := p.composerAttachmentCount(ctx)
+			if err == nil && count >= index+1 {
+				break
 			}
-			if chosen == nil {
-				chosen = ip
+			if time.Now().After(deadline) {
+				return fmt.Errorf("参考图上传未确认（%d/%d），已停止生成", count, len(references))
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(300 * time.Millisecond):
 			}
 		}
-		if chosen == nil {
-			return nil, errors.New("参考图 URL 无法解析")
-		}
-		// Dial the IP that was just validated to avoid DNS rebinding between check and dial.
-		return (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, network, net.JoinHostPort(chosen.String(), port))
+		time.Sleep(350 * time.Millisecond)
 	}
-	client := &http.Client{Transport: transport, Timeout: 20 * time.Second}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return nil, "", err
-	}
-	req.Header.Set("User-Agent", "Muse2API-Go/2.0")
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, "", errors.New("参考图下载失败")
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, "", fmt.Errorf("参考图下载 HTTP %d", resp.StatusCode)
-	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, (16<<20)+1))
-	if err != nil || len(data) > 16<<20 {
-		return nil, "", errors.New("参考图超过 16 MiB")
-	}
-	mimeType := resp.Header.Get("Content-Type")
-	if mediaType, _, err := mime.ParseMediaType(mimeType); err == nil {
-		mimeType = mediaType
-	}
-	if !strings.HasPrefix(mimeType, "image/") {
-		return nil, "", errors.New("远程参考内容不是图片")
-	}
-	return data, mimeType, nil
+	time.Sleep(500 * time.Millisecond)
+	return nil
 }
 
 func (p *Page) attachImage(ctx context.Context, raw string) error {
-	data, mimeType, err := normalizeReference(ctx, raw)
-	if err != nil || len(data) == 0 {
-		return errors.New("参考图读取失败，已停止生成")
-	}
-	if !strings.HasPrefix(mimeType, "image/") {
-		return errors.New("参考文件不是图片")
-	}
-	p.clearAttachments(ctx)
-	encoded := base64.StdEncoding.EncodeToString(data)
-	expression := `(function(b64,mime){try{var chars=atob(b64);var nums=new Array(chars.length);for(var i=0;i<chars.length;i++)nums[i]=chars.charCodeAt(i);var blob=new Blob([new Uint8Array(nums)],{type:mime});var ext=mime.split('/')[1]||'png';if(ext==='jpeg')ext='jpg';var file=new File([blob],'reference_image.'+ext,{type:mime});var inputs=Array.from(document.querySelectorAll('input[type="file"]'));if(!inputs.length)return JSON.stringify({ok:false,err:'no-file-input'});var ov=document.querySelector('[data-testid="hatch-composer-placeholder-overlay"]');var composer=ov?ov.closest('form'):null;var input=composer?inputs.find(function(x){return composer.contains(x);}):null;if(!input)input=inputs.find(function(x){return !x.closest('[class*=chat-user-bubble], [class*="group/msg"]');})||inputs[0];if(!input.getAttribute('accept'))input.setAttribute('accept','image/*');var dt=new DataTransfer();dt.items.add(file);input.files=dt.files;input.dispatchEvent(new Event('change',{bubbles:true}));input.dispatchEvent(new Event('input',{bubbles:true}));return JSON.stringify({ok:true});}catch(e){return JSON.stringify({ok:false,err:String(e)});}})(` + jsString(encoded) + `,` + jsString(mimeType) + `)`
-	var rawResult string
-	if err := p.conn.JS(ctx, expression, false, &rawResult); err != nil {
-		return err
-	}
-	var result struct {
-		OK bool `json:"ok"`
-	}
-	if err := json.Unmarshal([]byte(rawResult), &result); err != nil || !result.OK {
-		return errors.New("附加参考图失败，已停止生成")
-	}
-	deadline := time.Now().Add(15 * time.Second)
-	for time.Now().Before(deadline) {
-		var attached string
-		if err := p.conn.JS(ctx, `(function(){var btns=Array.from(document.querySelectorAll('button[aria-label]'));if(btns.some(function(b){return /remove\s*attachment|移除附件|删除附件/i.test(b.getAttribute('aria-label')||'');}))return 'remove';var ov=document.querySelector('[data-testid="hatch-composer-placeholder-overlay"]');var composer=ov?(ov.closest('form')||ov.parentElement.parentElement.parentElement):null;if(composer&&composer.querySelectorAll('img,video').length>0)return 'thumb';return '';})()`, false, &attached); err == nil && attached != "" {
-			time.Sleep(500 * time.Millisecond)
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(300 * time.Millisecond):
-		}
-	}
-	return errors.New("参考图上传未确认，已停止生成")
+	return p.attachImages(ctx, []string{raw})
 }
 
 func mediaSource(a attachment, expect string) string {
@@ -218,11 +172,62 @@ var mediaReportPattern = regexp.MustCompile(`(?i)\.(webp|png|jpe?g|mp4|webm)|ima
 var deliveryErrorPattern = regexp.MustCompile(`(?i)额度不足|积分不足|out of credits|达到上限|token limit`)
 var stuckDeliveryPattern = regexp.MustCompile(`(?i)Still sending|Delivery not confirmed|正在发送|未确认送达`)
 
+var imageRefusalPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)^(?:图片没生成成功|图片未生成成功|图片生成失败|无法生成图片)`),
+	regexp.MustCompile(`(?i)^(?:could not|couldn't|cannot|can't|unable to).{0,120}image`),
+}
+
+var videoRefusalPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)^(?:没生成成|视频没生成成功|视频未生成成功|视频生成失败).{0,240}(?:国家|地区|country|region).{0,160}(?:不支持|不可用|无法|not available|unavailable|not supported)`),
+	regexp.MustCompile(`(?i)^(?:could not|couldn't|cannot|can't|unable to).{0,120}video.{0,160}(?:country|region|not available|unavailable|not supported)`),
+}
+
+func cleanModelText(text string, limit int) string {
+	clean := strings.Join(strings.Fields(text), " ")
+	if limit <= 0 {
+		return clean
+	}
+	runes := []rune(clean)
+	if len(runes) > limit {
+		return string(runes[:limit])
+	}
+	return clean
+}
+
+func mediaRefusalText(text, expect string) string {
+	if strings.TrimSpace(text) == "" {
+		return ""
+	}
+	patterns := imageRefusalPatterns
+	if expect == "video" {
+		patterns = videoRefusalPatterns
+	}
+	lines := strings.Split(text, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		clean := cleanModelText(lines[i], 240)
+		if clean == "" {
+			continue
+		}
+		for _, pattern := range patterns {
+			if pattern.MatchString(clean) {
+				return clean
+			}
+		}
+	}
+	return ""
+}
+
 func (p *Page) waitAttachment(ctx context.Context, baseline map[string]bool, baseAgent, baseAttachments int, expect string) (*attachment, error) {
 	stableSrc := ""
 	stableCount := 0
-	lastText := ""
+	lastStateText := ""
+	stableText := ""
 	textStable := 0
+	refusalLast := ""
+	refusalStable := 0
+	seenStop := false
+	lastActivity := time.Now()
+	lastCount, lastAttachments, lastStop, lastPath := -1, -1, false, ""
 	started := time.Now()
 	for {
 		if err := ctx.Err(); err != nil {
@@ -264,27 +269,52 @@ func (p *Page) waitAttachment(ctx context.Context, baseline map[string]bool, bas
 			}
 		}
 		state, err := p.chatState(ctx)
-		if err == nil {
-			var tail string
-			_ = p.conn.JS(ctx, `document.body ? document.body.innerText.slice(-700) : ''`, false, &tail)
-			if deliveryErrorPattern.MatchString(tail) {
-				return nil, errors.New("账号额度不足")
-			}
-			if time.Since(started) > 30*time.Second && state.Count == baseAgent && stuckDeliveryPattern.MatchString(tail) {
-				return nil, errors.New("提示词未成功送达后端，终止等待")
-			}
-			if state.Count > baseAgent && state.Text != "" && !state.Stop && len(attachments) <= baseAttachments && !mediaReportPattern.MatchString(state.Text) {
-				if state.Text == lastText {
-					textStable++
-				} else {
-					lastText, textStable = state.Text, 0
-				}
-				if textStable >= 15 && time.Since(started) > 8*time.Second {
-					return nil, errors.New("模型未生成媒体，仅返回文本")
-				}
+		if err != nil {
+			continue
+		}
+		if state.Count != lastCount || state.Text != lastStateText || state.Stop != lastStop || state.Path != lastPath || len(attachments) != lastAttachments {
+			lastActivity = time.Now()
+			lastCount, lastStateText, lastStop, lastPath, lastAttachments = state.Count, state.Text, state.Stop, state.Path, len(attachments)
+		}
+		seenStop = seenStop || state.Stop
+		var tail string
+		_ = p.conn.JS(ctx, `document.body ? document.body.innerText.slice(-700) : ''`, false, &tail)
+		if deliveryErrorPattern.MatchString(tail) {
+			return nil, errors.New("账号额度不足")
+		}
+		if time.Since(started) > 30*time.Second && state.Count == baseAgent && stuckDeliveryPattern.MatchString(tail) {
+			return nil, errors.New("提示词未成功送达后端，终止等待")
+		}
+		refusal := mediaRefusalText(state.Text, expect)
+		if refusal != "" && !state.Stop && len(attachments) <= baseAttachments {
+			if refusal == refusalLast {
+				refusalStable++
 			} else {
-				textStable = 0
+				refusalLast, refusalStable = refusal, 0
 			}
+			if refusalStable >= 4 && time.Since(started) > 8*time.Second {
+				return nil, &protocol.ModelRefusalError{Message: refusal}
+			}
+		} else {
+			refusalLast, refusalStable = "", 0
+		}
+		if state.Count > baseAgent && state.Text != "" && !state.Stop && len(attachments) <= baseAttachments && !mediaReportPattern.MatchString(state.Text) {
+			if state.Text == stableText {
+				textStable++
+			} else {
+				stableText, textStable = state.Text, 0
+			}
+			if textStable >= 15 && time.Since(started) > 8*time.Second {
+				return nil, &protocol.ModelRefusalError{Message: cleanModelText(state.Text, 240)}
+			}
+		} else {
+			textStable = 0
+		}
+		if expect == "video" && seenStop && !state.Stop &&
+			strings.HasSuffix(strings.TrimRight(state.Path, "/"), "/thread/new") &&
+			state.Count <= baseAgent && len(attachments) <= baseAttachments &&
+			time.Since(started) >= 180*time.Second && time.Since(lastActivity) >= 90*time.Second {
+			return nil, errors.New("Muse 未建立视频任务线程，页面在提交结束后持续无响应（已提前停止等待）")
 		}
 	}
 }
@@ -409,7 +439,13 @@ func (e *Engine) saveMedia(data []byte, _ string, source, expect string) (*proto
 		return nil, err
 	}
 	base := strings.TrimRight(e.cfg.PublicBase, "/")
-	return &protocol.ImageResult{Filename: name, Kind: kind, URL: base + "/v1/media/" + name, Bytes: int64(len(data))}, nil
+	result := &protocol.ImageResult{Filename: name, Kind: kind, URL: base + "/v1/media/" + name, Bytes: int64(len(data))}
+	if kind == "video" {
+		if durationMS, width, height, ok := probeMP4Metadata(data); ok {
+			result.DurationMS, result.Width, result.Height = durationMS, width, height
+		}
+	}
+	return result, nil
 }
 
 func (p *Page) downloadFallback(ctx context.Context, src string) ([]byte, string, string, error) {
@@ -451,7 +487,7 @@ func (p *Page) downloadFallback(ctx context.Context, src string) ([]byte, string
 	return nil, "", "", errors.New("附件下载超时")
 }
 
-func (e *Engine) Generate(ctx context.Context, credentials protocol.AccountCredentials, prompt, expect, reference string) (result *protocol.ImageResult, updated protocol.AccountCredentials, returnErr error) {
+func (e *Engine) Generate(ctx context.Context, credentials protocol.AccountCredentials, prompt, expect string, references []string) (result *protocol.ImageResult, updated protocol.AccountCredentials, returnErr error) {
 	e.opMu.Lock()
 	defer e.opMu.Unlock()
 	updated = cloneCredentials(credentials)
@@ -472,8 +508,8 @@ func (e *Engine) Generate(ctx context.Context, credentials protocol.AccountCrede
 		syncCancel()
 	}()
 	_ = page.conn.JS(ctx, scrollBottomJS, false, nil)
-	if reference != "" {
-		if err := page.attachImage(ctx, reference); err != nil {
+	if len(references) > 0 {
+		if err := page.attachImages(ctx, references); err != nil {
 			return nil, updated, err
 		}
 	} else {

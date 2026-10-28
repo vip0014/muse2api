@@ -41,7 +41,7 @@ type Quota struct {
 	Found         bool     `json:"found"`
 	Plan          string   `json:"plan,omitempty"`
 	WeeklyReset   string   `json:"weekly_reset,omitempty"`
-	WeeklyUsedPct float64  `json:"weekly_used_pct,omitempty"`
+	WeeklyUsedPct float64  `json:"weekly_used_pct"`
 	ExtraUsedPct  *float64 `json:"extra_used_pct,omitempty"`
 	ExtraLeft     string   `json:"extra_left,omitempty"`
 	ExtraExpires  string   `json:"extra_expires,omitempty"`
@@ -97,6 +97,7 @@ type Task struct {
 	Resolution      string         `json:"resolution,omitempty"`
 	Duration        int            `json:"duration,omitempty"`
 	ReferenceImage  string         `json:"-"`
+	ReferenceImages []string       `json:"-"`
 	ResponseFormat  string         `json:"response_format,omitempty"`
 	IdempotencyKey  string         `json:"image_request_key,omitempty"`
 	RequestHash     string         `json:"image_request_hash,omitempty"`

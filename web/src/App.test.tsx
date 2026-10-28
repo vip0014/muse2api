@@ -18,7 +18,7 @@ it('loads the lazy dashboard after an authenticated session', async () => {
     if (String(input).includes('/admin/session')) return new Response('{"authenticated":true}', { status: 200 })
     if (String(input).includes('/admin/overview')) {
       return new Response(JSON.stringify({
-        status: 'ok', version: '2.0.0', account_stats: {}, task_stats: {},
+        status: 'ok', version: '2.1.0', account_stats: {}, task_stats: {},
         tasks: [], media_count: 0, events: [], base_url: '/v1',
         browser_enabled: true, browser_running: false,
       }), { status: 200, headers: { 'Content-Type': 'application/json' } })

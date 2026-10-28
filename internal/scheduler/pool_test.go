@@ -58,3 +58,26 @@ func TestPoolLimits(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestPoolAcceptsTwoCoreCookieAccount(t *testing.T) {
+	s, _ := storage.Open(t.TempDir(), []byte("01234567890123456789012345678901"), false)
+	a, err := s.AddAccount("two", map[string]string{"hatch_sess": "s", "hatch_vml": "v"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpdateAccount(a.ID, func(a *model.Account) error {
+		a.Status = model.AccountActive
+		a.ExpiresAt = time.Now().Add(time.Hour).Unix()
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	p := NewPool(s, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	lease, err := p.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("two-cookie account was not eligible: %v", err)
+	}
+	lease.Release()
+}

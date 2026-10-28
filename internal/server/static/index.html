@@ -3,18 +3,31 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#ffffff" />
+    <meta name="theme-color" content="#edf1f5" />
     <meta name="description" content="Muse2API 单管理员运维控制台" />
+    <script>
+      (() => {
+        try {
+          const stored = localStorage.getItem('muse2api-theme');
+          const theme = stored === 'light' || stored === 'dark' ? stored : (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+          document.documentElement.dataset.theme = theme;
+          document.documentElement.style.colorScheme = theme;
+          const meta = document.querySelector('meta[name="theme-color"]');
+          if (meta) meta.setAttribute('content', theme === 'dark' ? '#0b121b' : '#edf1f5');
+        } catch {}
+      })();
+    </script>
     <link rel="icon" href="/favicon.ico" sizes="any" />
     <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
     <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png" />
     <link rel="icon" type="image/png" sizes="48x48" href="/favicon-48.png" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
     <title>Muse2API Console</title>
-    <script type="module" crossorigin src="/assets/index-CzjYJ2ia.js"></script>
-    <link rel="modulepreload" crossorigin href="/assets/react-BkOObnqq.js">
-    <link rel="modulepreload" crossorigin href="/assets/data-C-I7l_qz.js">
-    <link rel="stylesheet" crossorigin href="/assets/index-CsX-iIId.css">
+    <script type="module" crossorigin src="/assets/index-DzIJkPnE.js"></script>
+    <link rel="modulepreload" crossorigin href="/assets/react-ws8qGAhA.js">
+    <link rel="modulepreload" crossorigin href="/assets/data-DSqNh_K9.js">
+    <link rel="modulepreload" crossorigin href="/assets/radix-mYUN4CFH.js">
+    <link rel="stylesheet" crossorigin href="/assets/index-_1_eIf2z.css">
   </head>
   <body><div id="root"></div></body>
 </html>

@@ -1,11 +1,17 @@
 {
   "manifest_version": 3,
-  "name": "Muse2API Cookie 导出",
-  "version": "1.0.0",
-  "description": "读取 muse.ai 登录 Cookie，生成 Muse2API 账号池可用的 Cookie Header、JSON 或批量导入行。",
+  "name": "__MSG_extName__",
+  "version": "1.0.1",
+  "description": "__MSG_extDesc__",
   "homepage_url": "https://github.com/vip0014/muse2api",
-  "permissions": ["cookies", "clipboardWrite"],
-  "host_permissions": ["https://muse.ai/*", "https://*.muse.ai/*"],
+  "permissions": [
+    "cookies",
+    "clipboardWrite"
+  ],
+  "host_permissions": [
+    "https://muse.ai/*",
+    "https://*.muse.ai/*"
+  ],
   "action": {
     "default_title": "导出 Muse Cookie",
     "default_popup": "popup.html",
@@ -21,5 +27,6 @@
     "32": "icons/icon-32.png",
     "48": "icons/icon-48.png",
     "128": "icons/icon-128.png"
-  }
+  },
+  "default_locale": "zh_CN"
 }

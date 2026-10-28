@@ -48,7 +48,7 @@ func (s *Server) adminStatus(w http.ResponseWriter, r *http.Request) {
 	for _, task := range rawTasks {
 		recent = append(recent, legacyTask(task))
 	}
-	writeJSON(w, 200, map[string]any{"status": "ok", "version": "2.0.0", "accounts": s.store.ListAccounts(), "account_stats": s.store.AccountStats(), "stats": stats, "tasks": recent, "task_stats": stats, "media_count": s.mediaCount(), "events": s.store.Events(10), "browser_running": s.browserRunning(), "browser_enabled": s.cfg.BrowserEnabled, "base_url": s.cfg.PublicBase + "/v1", "config": publicConfig(s.cfg)})
+	writeJSON(w, 200, map[string]any{"status": "ok", "version": "2.1.0", "accounts": s.store.ListAccounts(), "account_stats": s.store.AccountStats(), "stats": stats, "tasks": recent, "task_stats": stats, "media_count": s.mediaCount(), "events": s.store.Events(10), "browser_running": s.browserRunning(), "browser_enabled": s.cfg.BrowserEnabled, "base_url": s.cfg.PublicBase + "/v1", "config": publicConfig(s.cfg)})
 }
 func (s *Server) listAccounts(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"accounts": s.store.ListAccounts(), "stats": s.store.AccountStats()})
@@ -109,7 +109,7 @@ func (s *Server) addAccounts(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		added = append(added, a)
-		for _, name := range []string{"hatch_sess", "hatch_vml", "hatch_native_auth_device"} {
+		for _, name := range []string{"hatch_sess", "hatch_vml"} {
 			if e.cookies[name] == "" {
 				missing[name] = true
 			}
@@ -124,7 +124,7 @@ func (s *Server) addAccounts(w http.ResponseWriter, r *http.Request) {
 		miss = append(miss, k)
 	}
 	sort.Strings(miss)
-	writeJSON(w, 201, map[string]any{"added": added, "count": len(added), "essential_missing": miss, "auto_check": len(added) > 0, "warning": map[bool]string{true: "部分核心 Cookie 缺失，该账号可能无法使用", false: ""}[len(miss) > 0]})
+	writeJSON(w, 201, map[string]any{"added": added, "count": len(added), "essential_missing": miss, "auto_check": len(added) > 0, "warning": map[bool]string{true: "部分必要 Cookie 缺失，该账号可能无法使用", false: ""}[len(miss) > 0]})
 }
 func parseCookies(text string) map[string]string {
 	out := map[string]string{}
@@ -456,6 +456,7 @@ func (s *Server) cancelTask(w http.ResponseWriter, r *http.Request) {
 }
 func legacyTask(t model.Task) model.Task {
 	t.ReferenceImage = ""
+	t.ReferenceImages = nil
 	switch t.Status {
 	case model.TaskRunning:
 		t.Status = "processing"
@@ -562,10 +563,10 @@ func (s *Server) adminModels(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"data": s.driver.Capabilities(r.Context())})
 }
 func publicConfig(c config.Config) map[string]any {
-	return map[string]any{"host": c.Host, "port": c.Port, "public_base": c.PublicBase, "site": c.SiteURL, "concurrency": c.Concurrency, "queue_size": c.QueueSize, "image_timeout": int(c.ImageTimeout.Seconds()), "video_timeout": int(c.VideoTimeout.Seconds()), "chat_timeout": int(c.ChatTimeout.Seconds()), "media_dir": "data/media", "media_retention": "manual", "log_level": c.LogLevel, "credential_encryption": len(c.CredentialKey) == 32, "public_media": c.PublicMedia, "browser_runtime": c.BrowserEnabled, "cdp_port": c.CDPPort, "login_wait": int(c.LoginWait.Seconds()), "admin_username": c.AdminUsername, "session_ttl": int(c.SessionTTL.Seconds()), "trust_proxy": c.TrustProxy}
+	return map[string]any{"host": c.Host, "port": c.Port, "public_base": c.PublicBase, "site": c.SiteURL, "concurrency": c.Concurrency, "queue_size": c.QueueSize, "image_timeout": int(c.ImageTimeout.Seconds()), "video_timeout": int(c.VideoTimeout.Seconds()), "chat_timeout": int(c.ChatTimeout.Seconds()), "media_dir": "data/media", "media_retention": "manual", "log_level": c.LogLevel, "credential_encryption": len(c.CredentialKey) == 32, "public_media": c.PublicMedia, "browser_runtime": c.BrowserEnabled, "cdp_port": c.CDPPort, "login_wait": int(c.LoginWait.Seconds()), "admin_username": c.AdminUsername, "session_ttl": int(c.SessionTTL.Seconds()), "trust_proxy": c.TrustProxy, "max_upload_bytes": c.MaxUploadBytes, "ref_image_local_files": c.RefImageLocalFiles, "ref_image_private_fetch": c.RefImagePrivateFetch}
 }
 func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]any{"config": publicConfig(s.cfg), "version": "2.0.0", "restart_required_for": "MUSE2API_* 环境变量"})
+	writeJSON(w, 200, map[string]any{"config": publicConfig(s.cfg), "version": "2.1.0", "restart_required_for": "MUSE2API_* 环境变量"})
 }
 func (s *Server) backup(w http.ResponseWriter, r *http.Request) {
 	path, err := s.store.Backup(r.Context())
