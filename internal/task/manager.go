@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -192,7 +193,17 @@ func (m *Manager) startClose() {
 
 func safeError(err error) string {
 	if errors.Is(err, context.DeadlineExceeded) {
-		return "任务超时"
+		msg := err.Error()
+		if msg == context.DeadlineExceeded.Error() {
+			return "任务超时"
+		}
+		if !strings.Contains(msg, "超时") {
+			msg = "任务超时: " + msg
+		}
+		if len(msg) > 500 {
+			msg = msg[:500]
+		}
+		return msg
 	}
 	msg := err.Error()
 	if len(msg) > 500 {

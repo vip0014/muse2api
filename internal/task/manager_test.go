@@ -3,6 +3,7 @@ package task
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -147,5 +148,16 @@ func TestShutdownLeavesInterruptedTaskUnknown(t *testing.T) {
 	}
 	if err := m.Enqueue("after-close"); !errors.Is(err, ErrClosed) {
 		t.Fatalf("enqueue after close = %v", err)
+	}
+}
+
+func TestSafeErrorKeepsTimeoutStage(t *testing.T) {
+	if got := safeError(context.DeadlineExceeded); got != "任务超时" {
+		t.Fatalf("bare deadline = %q", got)
+	}
+	wrapped := fmt.Errorf("等待生成结果超时（未检测到新附件）: %w", context.DeadlineExceeded)
+	got := safeError(wrapped)
+	if !strings.Contains(got, "等待生成结果超时") {
+		t.Fatalf("stage detail was lost: %q", got)
 	}
 }

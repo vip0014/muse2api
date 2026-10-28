@@ -248,27 +248,19 @@ func (p *Page) waitAttachment(ctx context.Context, baseline map[string]bool, bas
 				matching = append(matching, item)
 			}
 		}
+		var candidate *attachment
+		source := ""
 		if len(matching) > 0 {
-			candidate := matching[len(matching)-1]
-			source := mediaSource(candidate, expect)
-			if expect == "video" && candidate.VSrc == "" {
+			item := matching[len(matching)-1]
+			source = mediaSource(item, expect)
+			if expect == "video" && item.VSrc == "" {
 				lower := strings.ToLower(source)
 				if !strings.HasSuffix(lower, ".mp4") && !strings.HasSuffix(lower, ".webm") && !strings.HasSuffix(lower, ".mov") {
 					source = ""
 				}
 			}
 			if source != "" && !baseline[source] {
-				if candidate.Width > 0 && candidate.Height > 0 {
-					return &candidate, nil
-				}
-				if source == stableSrc {
-					stableCount++
-				} else {
-					stableSrc, stableCount = source, 0
-				}
-				if stableCount >= 1 {
-					return &candidate, nil
-				}
+				candidate = &item
 			}
 		}
 		state, err := p.chatState(ctx)
@@ -283,6 +275,21 @@ func (p *Page) waitAttachment(ctx context.Context, baseline map[string]bool, bas
 			lastCount, lastStateText, lastStop, lastPath, lastAttachments = state.Count, state.Text, state.Stop, state.Path, len(attachments)
 		}
 		seenStop = seenStop || state.Stop
+		// Only accept the attachment after the turn has finished (the stop
+		// button is gone) and the source has been stable for two polls. An
+		// early partial/placeholder image would otherwise be fetched while the
+		// real file is still being written, which hangs extraction and burns the
+		// whole task timeout.
+		if candidate != nil && !state.Stop {
+			if source == stableSrc {
+				stableCount++
+			} else {
+				stableSrc, stableCount = source, 0
+			}
+			if stableCount >= 1 {
+				return candidate, nil
+			}
+		}
 		var tail string
 		_ = p.conn.JS(ctx, `document.body ? document.body.innerText.slice(-700) : ''`, false, &tail)
 		if deliveryErrorPattern.MatchString(tail) {
@@ -316,6 +323,15 @@ func (p *Page) waitAttachment(ctx context.Context, baseline map[string]bool, bas
 		} else {
 			textStable = 0
 		}
+		// The turn is over but no usable media appeared: fail clearly instead of
+		// waiting out the whole generation budget and reporting a bare timeout.
+		if expect == "image" && !state.Stop && candidate == nil && time.Since(lastActivity) > 45*time.Second {
+			message := "生成已结束但未检测到新图片"
+			if text := cleanModelText(state.Text, 200); text != "" {
+				message += "：" + text
+			}
+			return nil, errors.New(message)
+		}
 		if expect == "video" && seenStop && !state.Stop &&
 			strings.HasSuffix(strings.TrimRight(state.Path, "/"), "/thread/new") &&
 			state.Count <= baseAgent && len(attachments) <= baseAttachments &&
@@ -328,13 +344,19 @@ func (p *Page) waitAttachment(ctx context.Context, baseline map[string]bool, bas
 func (p *Page) extractBytes(ctx context.Context, src string) ([]byte, string, string, error) {
 	expression := `(async function(src,max){try{if(!src)return JSON.stringify({ok:false,err:'no-media-src'});var r=await fetch(src);if(!r.ok)return JSON.stringify({ok:false,err:'media-http-'+r.status});var b=await r.blob();if(b.size>max)return JSON.stringify({ok:false,err:'media-too-large'});var ab=await b.arrayBuffer();var bytes=new Uint8Array(ab);var s='';for(var i=0;i<bytes.length;i+=65536)s+=String.fromCharCode.apply(null,bytes.subarray(i,i+65536));return JSON.stringify({ok:true,mime:b.type||'',size:b.size,url:src,b64:btoa(s)});}catch(e){return JSON.stringify({ok:false,err:String(e)});}})(` + jsString(src) + `,` + fmt.Sprintf("%d", p.engine.cfg.MaxMediaBytes) + `)`
 	var lastErr error
-	for attempt := 0; attempt < 4; attempt++ {
+	for attempt := 0; attempt < 2; attempt++ {
 		var raw string
-		if err := p.conn.JS(ctx, expression, true, &raw); err != nil {
+		attemptCtx, attemptCancel := context.WithTimeout(ctx, 20*time.Second)
+		err := p.conn.JS(attemptCtx, expression, true, &raw)
+		attemptCancel()
+		if err != nil {
 			if IsConnectionError(err) {
 				return nil, "", "", err
 			}
 			lastErr = err
+			if ctx.Err() != nil {
+				return nil, "", "", ctx.Err()
+			}
 		} else {
 			var result struct {
 				OK   bool   `json:"ok"`
@@ -457,19 +479,97 @@ func (e *Engine) saveMedia(data []byte, _ string, source, expect string) (*proto
 	return result, nil
 }
 
+func (p *Page) extractCanvas(ctx context.Context, src string) ([]byte, string, string, error) {
+	expression := `(function(src,max){try{var img=[...document.querySelectorAll('img')].find(function(m){return(m.currentSrc||m.src||'')===src;});if(!img)return JSON.stringify({ok:false,err:'no-img'});var w=img.naturalWidth||img.width,h=img.naturalHeight||img.height;if(!w||!h)return JSON.stringify({ok:false,err:'no-size'});var c=document.createElement('canvas');c.width=w;c.height=h;var g=c.getContext('2d');g.drawImage(img,0,0,w,h);var data=c.toDataURL('image/png');var b64=data.split(',')[1]||'';if(!b64)return JSON.stringify({ok:false,err:'empty-data-url'});if(b64.length>max*2)return JSON.stringify({ok:false,err:'media-too-large'});return JSON.stringify({ok:true,mime:'image/png',url:src,b64:b64});}catch(e){return JSON.stringify({ok:false,err:String(e)});}})(` + jsString(src) + `,` + fmt.Sprintf("%d", p.engine.cfg.MaxMediaBytes) + `)`
+	var raw string
+	if err := p.conn.JS(ctx, expression, false, &raw); err != nil {
+		return nil, "", "", err
+	}
+	var result struct {
+		OK   bool   `json:"ok"`
+		MIME string `json:"mime"`
+		URL  string `json:"url"`
+		B64  string `json:"b64"`
+		Err  string `json:"err"`
+	}
+	if err := json.Unmarshal([]byte(raw), &result); err != nil || !result.OK {
+		if result.Err != "" {
+			return nil, "", "", errors.New("canvas 提取失败: " + result.Err)
+		}
+		return nil, "", "", errors.New("canvas 提取失败")
+	}
+	data, err := base64.StdEncoding.DecodeString(result.B64)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("canvas 数据解码失败: %w", err)
+	}
+	if len(data) == 0 || int64(len(data)) > p.engine.cfg.MaxMediaBytes {
+		return nil, "", "", errors.New("媒体字节为空或超过限制")
+	}
+	return data, result.MIME, result.URL, nil
+}
+
 func (p *Page) downloadFallback(ctx context.Context, src string) ([]byte, string, string, error) {
 	before := map[string]bool{}
 	entries, _ := os.ReadDir(p.engine.cfg.DownloadDir)
 	for _, entry := range entries {
 		before[entry.Name()] = true
 	}
-	var clicked string
-	if err := p.conn.JS(ctx, `(function(src){var media=[...document.querySelectorAll('img,video')].find(function(m){return(m.currentSrc||m.src||'')===src;});var node=media&&media.closest('[data-testid^="hatch-chat-attachment-presentation-"]');if(!node)return 'none';node=node.closest('[class*="group/widget-presentation"]')||node;var b=[...node.querySelectorAll('button,[role=button]')].find(function(x){return /下载|保存|download/i.test(x.getAttribute('aria-label')||'');});if(!b)return 'none';b.click();return 'ok';})(`+jsString(src)+`)`, false, &clicked); err != nil || clicked != "ok" {
-		return nil, "", "", errors.New("未找到对应附件下载按钮")
+
+	// The download control is often hover-only. Move the pointer over the media
+	// once so the control exists before the first query.
+	var rawRect string
+	_ = p.conn.JS(ctx, `(function(src){var m=[...document.querySelectorAll('img,video')].find(function(x){return(x.currentSrc||x.src||'')===src;});if(!m)return '';m.scrollIntoView({block:'center',inline:'nearest'});var r=m.getBoundingClientRect();return JSON.stringify({x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)});})(`+jsString(src)+`)`, false, &rawRect)
+	if rawRect != "" {
+		var point struct{ X, Y int }
+		if json.Unmarshal([]byte(rawRect), &point) == nil {
+			_ = p.conn.Call(ctx, "Input.dispatchMouseEvent", map[string]any{"type": "mouseMoved", "x": point.X, "y": point.Y}, nil)
+			select {
+			case <-ctx.Done():
+				return nil, "", "", ctx.Err()
+			case <-time.After(300 * time.Millisecond):
+			}
+		}
 	}
+
+	downloadButtonJS := `(function(src){var media=[...document.querySelectorAll('img,video')].find(function(m){return(m.currentSrc||m.src||'')===src;});if(!media)return 'none';var node=media.closest('[data-testid^="hatch-chat-attachment-presentation-"]')||media.closest('[class*="group/widget-presentation"]')||media.parentElement;if(!node)return 'none';var buttons=[...node.querySelectorAll('button,[role=button],a')];var b=buttons.find(function(x){var hay=[x.getAttribute('aria-label'),x.getAttribute('title'),x.getAttribute('data-testid'),x.getAttribute('href'),x.innerText].join(' ');return /下载|保存|download|save/i.test(hay);});if(!b)return 'none';b.click();return 'ok';})(` + jsString(src) + `)`
+
+	clicked := ""
+	buttonDeadline := time.Now().Add(10 * time.Second)
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, "", "", err
+		}
+		err := p.conn.JS(ctx, downloadButtonJS, false, &clicked)
+		if err != nil {
+			if IsConnectionError(err) {
+				return nil, "", "", err
+			}
+			if ctx.Err() != nil {
+				return nil, "", "", ctx.Err()
+			}
+		} else if clicked == "ok" {
+			break
+		}
+		if time.Now().After(buttonDeadline) {
+			return nil, "", "", errors.New("未找到对应附件下载按钮")
+		}
+		select {
+		case <-ctx.Done():
+			return nil, "", "", ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+
 	deadline := time.Now().Add(3 * time.Minute)
 	for time.Now().Before(deadline) {
-		time.Sleep(1500 * time.Millisecond)
+		if err := ctx.Err(); err != nil {
+			return nil, "", "", err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, "", "", ctx.Err()
+		case <-time.After(1500 * time.Millisecond):
+		}
 		entries, _ := os.ReadDir(p.engine.cfg.DownloadDir)
 		var candidates []string
 		for _, entry := range entries {
@@ -531,12 +631,7 @@ func retryableBeforeSubmit(err error) bool {
 	return IsRetryable(staged.err)
 }
 
-// Generate retries one connection-level failure that happened before the
-// prompt was submitted. The retry uses a fresh page (and, when needed, a fresh
-// browser connection) and shares the original task deadline.
-func (e *Engine) Generate(ctx context.Context, credentials protocol.AccountCredentials, prompt, expect string, references []string) (result *protocol.ImageResult, updated protocol.AccountCredentials, returnErr error) {
-	e.opMu.Lock()
-	defer e.opMu.Unlock()
+func (e *Engine) generationTimeout(expect string) time.Duration {
 	timeout := e.cfg.ImageTimeout
 	if expect == "video" {
 		timeout = e.cfg.VideoTimeout
@@ -544,7 +639,26 @@ func (e *Engine) Generate(ctx context.Context, credentials protocol.AccountCrede
 	if timeout <= 0 {
 		timeout = 240 * time.Second
 	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+	return timeout
+}
+
+func extractionReserve(expect string) time.Duration {
+	if expect == "video" {
+		return 120 * time.Second
+	}
+	return 60 * time.Second
+}
+
+// Generate retries one connection-level failure that happened before the
+// prompt was submitted. The retry uses a fresh page (and, when needed, a fresh
+// browser connection) and shares the original task deadline. The overall
+// deadline includes a separate extraction reserve so a late image still has
+// time to be fetched.
+func (e *Engine) Generate(ctx context.Context, credentials protocol.AccountCredentials, prompt, expect string, references []string) (result *protocol.ImageResult, updated protocol.AccountCredentials, returnErr error) {
+	e.opMu.Lock()
+	defer e.opMu.Unlock()
+	timeout := e.generationTimeout(expect)
+	ctx, cancel := context.WithTimeout(ctx, timeout+extractionReserve(expect))
 	defer cancel()
 
 	updated = cloneCredentials(credentials)
@@ -569,12 +683,14 @@ func (e *Engine) Generate(ctx context.Context, credentials protocol.AccountCrede
 	return nil, updated, lastErr
 }
 
-// generateOnce assumes opMu is already held by Generate. The timeout also
+// generateOnce assumes opMu is already held by Generate. The generation timeout
 // starts after the lock is acquired, so time spent queueing behind another
 // browser task does not consume the generation budget.
 func (e *Engine) generateOnce(ctx context.Context, credentials protocol.AccountCredentials, prompt, expect string, references []string) (result *protocol.ImageResult, updated protocol.AccountCredentials, returnErr error) {
+	genCtx, genCancel := context.WithTimeout(ctx, e.generationTimeout(expect))
+	defer genCancel()
 	updated = cloneCredentials(credentials)
-	page, err := e.authenticatedPage(ctx, credentials)
+	page, err := e.authenticatedPage(genCtx, credentials)
 	if err != nil {
 		return nil, updated, stageErr(stageConnect, err)
 	}
@@ -584,15 +700,15 @@ func (e *Engine) generateOnce(ctx context.Context, credentials protocol.AccountC
 		updated = page.readCredentials(syncCtx, updated)
 		syncCancel()
 	}()
-	_ = page.conn.JS(ctx, scrollBottomJS, false, nil)
+	_ = page.conn.JS(genCtx, scrollBottomJS, false, nil)
 	if len(references) > 0 {
-		if err := page.attachImages(ctx, references); err != nil {
+		if err := page.attachImages(genCtx, references); err != nil {
 			return nil, updated, stageErr(stageConnect, err)
 		}
 	} else {
-		page.clearAttachments(ctx)
+		page.clearAttachments(genCtx)
 	}
-	before, err := page.attachments(ctx)
+	before, err := page.attachments(genCtx)
 	if err != nil {
 		return nil, updated, stageErr(stageConnect, err)
 	}
@@ -604,25 +720,33 @@ func (e *Engine) generateOnce(ctx context.Context, credentials protocol.AccountC
 			}
 		}
 	}
-	state, err := page.chatState(ctx)
+	state, err := page.chatState(genCtx)
 	if err != nil {
 		return nil, updated, stageErr(stageConnect, err)
 	}
-	clicked, err := page.sendPrompt(ctx, prompt)
+	clicked, err := page.sendPrompt(genCtx, prompt)
 	if err != nil {
 		return nil, updated, stageErr(stagePrompt, err)
 	}
 	if clicked != "clicked" && clicked != "enter-sent" {
 		return nil, updated, stageErr(stagePrompt, errors.New("提示词发送未确认，已停止生成"))
 	}
-	found, err := page.waitAttachment(ctx, baseline, state.Count, len(before), expect)
+	found, err := page.waitAttachment(genCtx, baseline, state.Count, len(before), expect)
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return nil, updated, stageErr(stageWait, fmt.Errorf("等待生成结果超时（未检测到新附件）: %w", err))
+		}
 		return nil, updated, stageErr(stageWait, err)
 	}
 	source := mediaSource(*found, expect)
-	data, mimeType, finalURL, extractErr := page.extractBytes(ctx, source)
+	extractCtx, extractCancel := context.WithTimeout(ctx, extractionReserve(expect))
+	defer extractCancel()
+	data, mimeType, finalURL, extractErr := page.extractBytes(extractCtx, source)
+	if extractErr != nil && expect == "image" {
+		data, mimeType, finalURL, extractErr = page.extractCanvas(extractCtx, source)
+	}
 	if extractErr != nil {
-		data, mimeType, finalURL, extractErr = page.downloadFallback(ctx, source)
+		data, mimeType, finalURL, extractErr = page.downloadFallback(extractCtx, source)
 	}
 	if extractErr != nil {
 		return nil, updated, stageErr(stageExtract, fmt.Errorf("已生成但未能取回媒体文件: %w", extractErr))
