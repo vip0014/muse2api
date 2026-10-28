@@ -237,6 +237,9 @@ func (p *Page) waitAttachment(ctx context.Context, baseline map[string]bool, bas
 		_ = p.conn.JS(ctx, scrollBottomJS, false, nil)
 		attachments, err := p.attachments(ctx)
 		if err != nil {
+			if IsConnectionError(err) {
+				return nil, err
+			}
 			continue
 		}
 		matching := make([]attachment, 0, len(attachments))
@@ -270,6 +273,9 @@ func (p *Page) waitAttachment(ctx context.Context, baseline map[string]bool, bas
 		}
 		state, err := p.chatState(ctx)
 		if err != nil {
+			if IsConnectionError(err) {
+				return nil, err
+			}
 			continue
 		}
 		if state.Count != lastCount || state.Text != lastStateText || state.Stop != lastStop || state.Path != lastPath || len(attachments) != lastAttachments {
@@ -325,6 +331,9 @@ func (p *Page) extractBytes(ctx context.Context, src string) ([]byte, string, st
 	for attempt := 0; attempt < 4; attempt++ {
 		var raw string
 		if err := p.conn.JS(ctx, expression, true, &raw); err != nil {
+			if IsConnectionError(err) {
+				return nil, "", "", err
+			}
 			lastErr = err
 		} else {
 			var result struct {
@@ -487,19 +496,87 @@ func (p *Page) downloadFallback(ctx context.Context, src string) ([]byte, string
 	return nil, "", "", errors.New("附件下载超时")
 }
 
+type generationStage string
+
+const (
+	stageConnect generationStage = "connect"
+	stagePrompt  generationStage = "prompt"
+	stageWait    generationStage = "wait"
+	stageExtract generationStage = "extract"
+)
+
+type stageError struct {
+	stage generationStage
+	err   error
+}
+
+func (e *stageError) Error() string { return e.err.Error() }
+func (e *stageError) Unwrap() error { return e.err }
+
+func stageErr(stage generationStage, err error) error {
+	if err == nil {
+		return nil
+	}
+	return &stageError{stage: stage, err: err}
+}
+
+// retryableBeforeSubmit deliberately excludes prompt/wait/extract stages: once
+// the prompt is submitted the upstream may still be generating, so an
+// automatic retry could duplicate a paid generation.
+func retryableBeforeSubmit(err error) bool {
+	var staged *stageError
+	if !errors.As(err, &staged) || staged.stage != stageConnect {
+		return false
+	}
+	return IsRetryable(staged.err)
+}
+
+// Generate retries one connection-level failure that happened before the
+// prompt was submitted. The retry uses a fresh page (and, when needed, a fresh
+// browser connection) and shares the original task deadline.
 func (e *Engine) Generate(ctx context.Context, credentials protocol.AccountCredentials, prompt, expect string, references []string) (result *protocol.ImageResult, updated protocol.AccountCredentials, returnErr error) {
 	e.opMu.Lock()
 	defer e.opMu.Unlock()
-	updated = cloneCredentials(credentials)
 	timeout := e.cfg.ImageTimeout
 	if expect == "video" {
 		timeout = e.cfg.VideoTimeout
 	}
+	if timeout <= 0 {
+		timeout = 240 * time.Second
+	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+
+	updated = cloneCredentials(credentials)
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		// Carry refreshed cookies from a failed pre-submit attempt into the
+		// retry; the deferred credential sync may already have rotated them.
+		result, updated, returnErr = e.generateOnce(ctx, updated, prompt, expect, references)
+		if returnErr == nil {
+			return result, updated, nil
+		}
+		lastErr = returnErr
+		if ctx.Err() != nil || !retryableBeforeSubmit(returnErr) {
+			return nil, updated, returnErr
+		}
+		select {
+		case <-ctx.Done():
+			return nil, updated, ctx.Err()
+		case <-time.After(750 * time.Millisecond):
+		}
+	}
+	return nil, updated, lastErr
+}
+
+// generateOnce assumes opMu is already held by Generate. The timeout also
+// starts after the lock is acquired, so time spent queueing behind another
+// browser task does not consume the generation budget.
+func (e *Engine) generateOnce(ctx context.Context, credentials protocol.AccountCredentials, prompt, expect string, references []string) (result *protocol.ImageResult, updated protocol.AccountCredentials, returnErr error) {
+	updated = cloneCredentials(credentials)
 	page, err := e.authenticatedPage(ctx, credentials)
 	if err != nil {
-		return nil, updated, err
+		return nil, updated, stageErr(stageConnect, err)
 	}
 	defer page.close()
 	defer func() {
@@ -510,12 +587,15 @@ func (e *Engine) Generate(ctx context.Context, credentials protocol.AccountCrede
 	_ = page.conn.JS(ctx, scrollBottomJS, false, nil)
 	if len(references) > 0 {
 		if err := page.attachImages(ctx, references); err != nil {
-			return nil, updated, err
+			return nil, updated, stageErr(stageConnect, err)
 		}
 	} else {
 		page.clearAttachments(ctx)
 	}
-	before, _ := page.attachments(ctx)
+	before, err := page.attachments(ctx)
+	if err != nil {
+		return nil, updated, stageErr(stageConnect, err)
+	}
 	baseline := map[string]bool{}
 	for _, item := range before {
 		for _, source := range []string{item.Src, item.VSrc, item.ISrc} {
@@ -524,17 +604,20 @@ func (e *Engine) Generate(ctx context.Context, credentials protocol.AccountCrede
 			}
 		}
 	}
-	state, _ := page.chatState(ctx)
+	state, err := page.chatState(ctx)
+	if err != nil {
+		return nil, updated, stageErr(stageConnect, err)
+	}
 	clicked, err := page.sendPrompt(ctx, prompt)
 	if err != nil {
-		return nil, updated, err
+		return nil, updated, stageErr(stagePrompt, err)
 	}
 	if clicked != "clicked" && clicked != "enter-sent" {
-		return nil, updated, errors.New("提示词发送未确认，已停止生成")
+		return nil, updated, stageErr(stagePrompt, errors.New("提示词发送未确认，已停止生成"))
 	}
 	found, err := page.waitAttachment(ctx, baseline, state.Count, len(before), expect)
 	if err != nil {
-		return nil, updated, err
+		return nil, updated, stageErr(stageWait, err)
 	}
 	source := mediaSource(*found, expect)
 	data, mimeType, finalURL, extractErr := page.extractBytes(ctx, source)
@@ -542,8 +625,8 @@ func (e *Engine) Generate(ctx context.Context, credentials protocol.AccountCrede
 		data, mimeType, finalURL, extractErr = page.downloadFallback(ctx, source)
 	}
 	if extractErr != nil {
-		return nil, updated, errors.New("已生成但未能取回媒体文件")
+		return nil, updated, stageErr(stageExtract, fmt.Errorf("已生成但未能取回媒体文件: %w", extractErr))
 	}
 	result, err = e.saveMedia(data, mimeType, finalURL, expect)
-	return result, updated, err
+	return result, updated, stageErr(stageExtract, err)
 }

@@ -118,3 +118,67 @@ func TestCDPCloseUnblocksPendingCall(t *testing.T) {
 		t.Fatal("CDP Close did not unblock the pending call")
 	}
 }
+
+func TestCDPTimeoutKeepsConnectionUsable(t *testing.T) {
+	conn := testCDP(t, func(ws *websocket.Conn) {
+		var first cdpMessage
+		if err := ws.ReadJSON(&first); err != nil {
+			return
+		}
+		time.Sleep(120 * time.Millisecond)
+		_ = ws.WriteJSON(map[string]any{"id": first.ID, "result": map[string]any{"delayed": true}})
+
+		var second cdpMessage
+		if err := ws.ReadJSON(&second); err != nil {
+			return
+		}
+		_ = ws.WriteJSON(map[string]any{"id": second.ID, "result": map[string]any{"ok": true}})
+	})
+
+	conn.timeout = 40 * time.Millisecond
+	if err := conn.Call(context.Background(), "Runtime.evaluate", map[string]any{}, nil); err == nil || !strings.Contains(err.Error(), "超时") {
+		t.Fatalf("expected timeout, got %v", err)
+	}
+
+	conn.timeout = time.Second
+	var result struct{ OK bool }
+	if err := conn.Call(context.Background(), "Runtime.evaluate", map[string]any{}, &result); err != nil {
+		t.Fatalf("a timed-out call poisoned the connection: %v", err)
+	}
+	if !result.OK {
+		t.Fatal("second call did not receive the response")
+	}
+}
+
+func TestCDPFailedReadIsStickyWithoutPanic(t *testing.T) {
+	conn := testCDP(t, func(ws *websocket.Conn) {
+		var request cdpMessage
+		_ = ws.ReadJSON(&request)
+		// Return without responding: the server closes the socket, which is an
+		// unrecoverable read error for gorilla/websocket.
+	})
+
+	var err error
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		err = conn.Call(context.Background(), "Runtime.evaluate", map[string]any{}, nil)
+		if err != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err == nil {
+		t.Fatal("expected a connection error")
+	}
+	if !IsConnectionError(err) {
+		t.Fatalf("expected connection error, got %v", err)
+	}
+
+	// The old implementation panicked after repeated reads; every later call
+	// must now return the same typed error without touching the socket.
+	for i := 0; i < 20; i++ {
+		if callErr := conn.Call(context.Background(), "Runtime.evaluate", map[string]any{}, nil); !IsConnectionError(callErr) {
+			t.Fatalf("call %d after failed read: %v", i, callErr)
+		}
+	}
+}

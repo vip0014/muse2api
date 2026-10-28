@@ -190,6 +190,9 @@ func (e *Engine) Chat(ctx context.Context, credentials protocol.AccountCredentia
 		time.Sleep(60 * time.Millisecond)
 		state, err := page.chatState(ctx)
 		if err != nil {
+			if IsConnectionError(err) {
+				return updated, err
+			}
 			continue
 		}
 		current := state.Text
@@ -227,7 +230,13 @@ func (e *Engine) Chat(ctx context.Context, credentials protocol.AccountCredentia
 		}
 		time.Sleep(chatPollInterval)
 		state, err := page.chatState(ctx)
-		if err != nil || state.Text == "" {
+		if err != nil {
+			if IsConnectionError(err) {
+				return updated, err
+			}
+			continue
+		}
+		if state.Text == "" {
 			continue
 		}
 		if state.Stop {

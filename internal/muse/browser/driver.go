@@ -48,6 +48,8 @@ func (d *Driver) BrowserRunning() bool {
 // Warm starts Chromium before the first quota or generation request so the
 // import-triggered check does not pay the full startup cost.
 func (d *Driver) Warm(ctx context.Context) error {
+	d.engine.opMu.Lock()
+	defer d.engine.opMu.Unlock()
 	return d.engine.start(ctx)
 }
 

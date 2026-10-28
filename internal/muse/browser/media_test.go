@@ -73,3 +73,15 @@ func TestMediaRefusalText(t *testing.T) {
 		t.Fatalf("ordinary text treated as refusal: %q", got)
 	}
 }
+
+func TestRetryableBeforeSubmitOnlyForConnectStage(t *testing.T) {
+	if !retryableBeforeSubmit(stageErr(stageConnect, ErrCDPConnectionLost)) {
+		t.Fatal("connection failure before submit should be retryable")
+	}
+	if retryableBeforeSubmit(stageErr(stagePrompt, ErrCDPConnectionLost)) {
+		t.Fatal("connection failure after submit must not be retried automatically")
+	}
+	if retryableBeforeSubmit(stageErr(stageConnect, errors.New("invalid reference image"))) {
+		t.Fatal("business error must not be retried")
+	}
+}

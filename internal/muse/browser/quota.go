@@ -54,6 +54,8 @@ func (p *Page) waitQuotaReady(ctx context.Context) error {
 			case "logged-out":
 				return fmt.Errorf("网页会话已登出: %w", protocol.ErrSessionExpired)
 			}
+		} else if IsConnectionError(err) {
+			return err
 		}
 		select {
 		case <-ctx.Done():
@@ -68,7 +70,12 @@ func (p *Page) quotaClick(ctx context.Context, expression, errorMessage string) 
 	deadline := time.Now().Add(8 * time.Second)
 	for time.Now().Before(deadline) {
 		var raw string
-		if err := p.conn.JS(ctx, expression, false, &raw); err == nil && raw != "" {
+		err := p.conn.JS(ctx, expression, false, &raw)
+		if err != nil {
+			if IsConnectionError(err) {
+				return err
+			}
+		} else if raw != "" {
 			var point struct{ X, Y int }
 			if json.Unmarshal([]byte(raw), &point) == nil {
 				return p.clickPoint(ctx, point.X, point.Y)
@@ -205,7 +212,12 @@ func (e *Engine) Quota(ctx context.Context, credentials protocol.AccountCredenti
 	deadline := time.Now().Add(12 * time.Second)
 	for time.Now().Before(deadline) {
 		var text string
-		if err := page.conn.JS(ctx, quotaDialogJS, false, &text); err == nil {
+		err := page.conn.JS(ctx, quotaDialogJS, false, &text)
+		if err != nil {
+			if IsConnectionError(err) {
+				return quota, updated, err
+			}
+		} else {
 			quota = parseQuota(text)
 			if quota.Found {
 				quota.CheckedAt = time.Now().Unix()

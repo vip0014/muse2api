@@ -35,13 +35,14 @@ type Config struct {
 }
 
 type Engine struct {
-	cfg     Config
-	opMu    sync.Mutex
-	lifeMu  sync.Mutex
-	browser *CDP
-	cmd     *exec.Cmd
-	logFile *os.File
-	closed  bool
+	cfg      Config
+	opMu     sync.Mutex
+	lifeMu   sync.Mutex
+	browser  *CDP
+	cmd      *exec.Cmd
+	procDone chan struct{}
+	logFile  *os.File
+	closed   bool
 }
 
 type Page struct {
@@ -134,6 +135,7 @@ func (e *Engine) start(ctx context.Context) error {
 		if err == nil {
 			return nil
 		}
+		// Any failed liveness check means the old socket must never be reused.
 		_ = e.browser.Close()
 		e.browser = nil
 	}
@@ -171,11 +173,16 @@ func (e *Engine) start(ctx context.Context) error {
 	cmd.Stderr = logFile
 	if err := cmd.Start(); err != nil {
 		_ = logFile.Close()
-		return fmt.Errorf("Chromium 启动失败: %w", err)
+		return fmt.Errorf("%w: Chromium 启动失败: %v", ErrBrowserUnavailable, err)
 	}
 	e.cmd = cmd
 	e.logFile = logFile
-	go func() { _ = cmd.Wait() }()
+	e.procDone = make(chan struct{})
+	procDone := e.procDone
+	go func() {
+		defer close(procDone)
+		_ = cmd.Wait()
+	}()
 	for attempt := 0; attempt < 90; attempt++ {
 		if err := ctx.Err(); err != nil {
 			e.stopStartedLocked()
@@ -194,16 +201,25 @@ func (e *Engine) start(ctx context.Context) error {
 		}
 	}
 	e.stopStartedLocked()
-	return errors.New("Chromium 已启动但 CDP 在 90 秒内未就绪")
+	return fmt.Errorf("%w: Chromium 已启动但 CDP 在 90 秒内未就绪", ErrBrowserUnavailable)
 }
 
 // stopStartedLocked terminates a Chromium process started by this engine and
-// releases its log descriptor. A failed start must not leave either behind.
+// releases its log descriptor. It waits for the child to exit so a relaunch
+// cannot race the old process for the CDP port. A failed start must not leave
+// either behind.
 func (e *Engine) stopStartedLocked() {
 	if e.cmd != nil && e.cmd.Process != nil {
 		_ = e.cmd.Process.Kill()
+		if e.procDone != nil {
+			select {
+			case <-e.procDone:
+			case <-time.After(5 * time.Second):
+			}
+		}
 	}
 	e.cmd = nil
+	e.procDone = nil
 	if e.logFile != nil {
 		_ = e.logFile.Close()
 		e.logFile = nil
@@ -335,6 +351,9 @@ func (p *Page) waitReady(ctx context.Context) error {
 		})()`, false, &state)
 		if err == nil && state == "ready" {
 			return nil
+		}
+		if err != nil && IsConnectionError(err) {
+			return err
 		}
 		select {
 		case <-ctx.Done():
