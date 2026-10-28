@@ -29,9 +29,15 @@ const pollChatJS = `(function(){
 		.filter(function(b){return /hatch-agent-bubble-bg/.test(b.className||'');});
 	var nonEmpty=bs.filter(function(b){return ((b.innerText||'').trim().length)>0;});
 	var txt=nonEmpty.length?(nonEmpty[nonEmpty.length-1].innerText||'').trim():'';
-	var stop=!!(document.querySelector('[data-testid="hatch-composer-stop-button"]')
-		||document.querySelector('button[aria-label*="Stop" i]')
-		||document.querySelector('button[aria-label*="停止"]'));
+	var visible=function(e){
+		if(!e||e.getClientRects().length===0)return false;
+		var s=getComputedStyle(e);
+		return s.visibility!=='hidden'&&s.display!=='none'&&parseFloat(s.opacity||'1')>0;
+	};
+	var stop=visible(document.querySelector('[data-testid="hatch-composer-stop-button"]'))
+		||[...document.querySelectorAll('button[aria-label],[role=button][aria-label]')].some(function(b){
+			return visible(b)&&/stop|停止/i.test(b.getAttribute('aria-label')||'');
+		});
 	return JSON.stringify({cnt:nonEmpty.length,total:bs.length,txt:txt,stop:stop,path:location.pathname||''});
 })()`
 

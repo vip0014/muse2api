@@ -33,18 +33,41 @@ type attachment struct {
 }
 
 const attachmentsJS = `(function(){
-	var list=[];var seen=new Set();
-	function addEl(el,tid){
-		if(!el||seen.has(el))return;seen.add(el);
-		if(el.closest('form, [class*=chat-user-bubble], [class*="group/msg"]'))return;
-		var v=el.querySelector('video')||(el.tagName==='VIDEO'?el:null);
-		var img=el.querySelector('img')||(el.tagName==='IMG'?el:null);
-		var isVid=(tid||'').includes('video')||!!v;var primary=isVid?(v||img):(img||v);
-		var src=primary?(primary.currentSrc||primary.src||''):'';
-		if(src&&!seen.has(src)){seen.add(src);list.push({tid:tid||el.getAttribute('data-testid')||(isVid?'video':'image'),hasVideo:!!v,hasImg:!!img,src:src,vSrc:v?(v.currentSrc||v.src||''):'',iSrc:img?(img.currentSrc||img.src||''):'',w:primary?(primary.videoWidth||primary.naturalWidth||0):0,h:primary?(primary.videoHeight||primary.naturalHeight||0):0});}
+	var list=[], seen=new Set();
+	function add(src,tid,el){
+		if(!src||seen.has(src))return;
+		seen.add(src);
+		var v=el&&(el.tagName==='VIDEO'?el:(el.querySelector?el.querySelector('video'):null));
+		var img=el&&(el.tagName==='IMG'?el:(el.querySelector?el.querySelector('img'):null));
+		var primary=v||img;
+		var w=primary?(primary.videoWidth||primary.naturalWidth||primary.width||0):0;
+		var h=primary?(primary.videoHeight||primary.naturalHeight||primary.height||0):0;
+		if(w&&h&&w<100&&h<100)return;
+		list.push({tid:tid||'',hasVideo:!!v,hasImg:!!img,src:src,vSrc:v?(v.currentSrc||v.src||''):'',iSrc:img?(img.currentSrc||img.src||''):'',w:w,h:h});
 	}
-	document.querySelectorAll('[data-testid^="hatch-chat-attachment-presentation-"]').forEach(function(a){addEl(a,a.getAttribute('data-testid'));});
-	document.querySelectorAll('div[class*="hatch-agent-bubble-bg"] img, div[class*="hatch-agent-bubble-bg"] video').forEach(function(m){var s=m.currentSrc||m.src||'';if(s&&!s.includes('avatar')&&!s.includes('emoji'))addEl(m.parentElement||m,'agent-media');});
+	var scope=document;
+	function skip(el){return el.closest('form, [class*=chat-user-bubble]');}
+	scope.querySelectorAll('[data-testid*="attachment"],[data-testid*="presentation"],[class*="attachment"]').forEach(function(a){
+		if(skip(a))return;
+		var v=a.querySelector('video'), img=a.querySelector('img');
+		if(v)add(v.currentSrc||v.src,a.getAttribute('data-testid')||'video',a);
+		else if(img)add(img.currentSrc||img.src,a.getAttribute('data-testid')||'image',a);
+	});
+	scope.querySelectorAll('img,video').forEach(function(m){
+		if(skip(m))return;
+		var src=m.currentSrc||m.src||'';
+		if(!src||/avatar|emoji|icon|logo|favicon|sprite/i.test(src))return;
+		var w=m.videoWidth||m.naturalWidth||m.width||0;
+		var h=m.videoHeight||m.naturalHeight||m.height||0;
+		if(w&&h&&w<100&&h<100)return;
+		add(src,m.tagName==='VIDEO'?'video':'image',m);
+	});
+	scope.querySelectorAll('div[class*="hatch-agent-bubble-bg"] div, div[class*="hatch-agent-bubble-bg"] a').forEach(function(el){
+		if(skip(el))return;
+		var bg=getComputedStyle(el).backgroundImage||'';
+		var m=bg.match(/url\(["']?(.*?)["']?\)/);
+		if(m&&m[1]&&!/avatar|emoji|icon|logo|favicon|sprite/i.test(m[1]))add(m[1],'background',el);
+	});
 	return JSON.stringify(list);
 })()`
 
@@ -231,6 +254,9 @@ func (p *Page) waitAttachment(ctx context.Context, baseline map[string]bool, bas
 	started := time.Now()
 	for {
 		if err := ctx.Err(); err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				return nil, fmt.Errorf("等待生成超时（stop=%v, bubbles=%d, attachments=%d, text=%q）: %w", lastStop, lastCount, lastAttachments, cleanModelText(lastStateText, 80), err)
+			}
 			return nil, err
 		}
 		time.Sleep(600 * time.Millisecond)
@@ -287,6 +313,18 @@ func (p *Page) waitAttachment(ctx context.Context, baseline map[string]bool, bas
 				stableSrc, stableCount = source, 0
 			}
 			if stableCount >= 1 {
+				return candidate, nil
+			}
+		} else if candidate != nil && state.Stop {
+			// Some UI builds keep a disabled stop control mounted. A large media
+			// source that has not changed for six seconds is still a reliable
+			// final-image signal; a small/zero-size placeholder is ignored.
+			if source == stableSrc {
+				stableCount++
+			} else {
+				stableSrc, stableCount = source, 0
+			}
+			if stableCount >= 10 && candidate.Width >= 256 && candidate.Height >= 256 {
 				return candidate, nil
 			}
 		}
@@ -733,8 +771,8 @@ func (e *Engine) generateOnce(ctx context.Context, credentials protocol.AccountC
 	}
 	found, err := page.waitAttachment(genCtx, baseline, state.Count, len(before), expect)
 	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
-			return nil, updated, stageErr(stageWait, fmt.Errorf("等待生成结果超时（未检测到新附件）: %w", err))
+		if err == context.DeadlineExceeded {
+			err = fmt.Errorf("等待生成结果超时: %w", err)
 		}
 		return nil, updated, stageErr(stageWait, err)
 	}
