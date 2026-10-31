@@ -184,25 +184,58 @@ func (p *Page) attachImages(ctx context.Context, references []string) error {
 		}
 		name := fmt.Sprintf("reference_image_%d.%s", index+1, ext)
 		encoded := base64.StdEncoding.EncodeToString(data)
-		expression := `(function(b64,mime,name){try{var chars=atob(b64);var nums=new Array(chars.length);for(var i=0;i<chars.length;i++)nums[i]=chars.charCodeAt(i);var blob=new Blob([new Uint8Array(nums)],{type:mime});var file=new File([blob],name,{type:mime});var inputs=Array.from(document.querySelectorAll('input[type="file"]'));if(!inputs.length)return JSON.stringify({ok:false,err:'no-file-input'});var ov=document.querySelector('[data-testid="hatch-composer-placeholder-overlay"]');var composer=ov?ov.closest('form'):null;var input=composer?inputs.find(function(x){return composer.contains(x);}):null;if(!input)input=inputs.find(function(x){return !x.closest('[class*=chat-user-bubble], [class*="group/msg"]');})||inputs[0];if(!input.getAttribute('accept'))input.setAttribute('accept','image/*');var dt=new DataTransfer();dt.items.add(file);input.files=dt.files;input.dispatchEvent(new Event('change',{bubbles:true}));input.dispatchEvent(new Event('input',{bubbles:true}));return JSON.stringify({ok:true});}catch(e){return JSON.stringify({ok:false,err:String(e)});}})(` + jsString(encoded) + `,` + jsString(mimeType) + `,` + jsString(name) + `)`
+		expression := `(function(b64,mime,name){try{var chars=atob(b64);var nums=new Array(chars.length);for(var i=0;i<chars.length;i++)nums[i]=chars.charCodeAt(i);var blob=new Blob([new Uint8Array(nums)],{type:mime});var file=new File([blob],name,{type:mime});var inputs=Array.from(document.querySelectorAll('input[type="file"]'));if(!inputs.length)return JSON.stringify({ok:false,err:'no-file-input'});var ov=document.querySelector('[data-testid="hatch-composer-placeholder-overlay"]');var composer=ov?ov.closest('form'):null;var input=composer?inputs.find(function(x){return composer.contains(x);}):null;if(!input)input=inputs.find(function(x){return !x.closest('[class*=chat-user-bubble], [class*="group/msg"]');})||inputs[0];if(!input.getAttribute('accept'))input.setAttribute('accept','image/*');var dt=new DataTransfer();dt.items.add(file);input.files=dt.files;input.dispatchEvent(new Event('change',{bubbles:true}));input.dispatchEvent(new Event('input',{bubbles:true}));return JSON.stringify({ok:true,filesLen:input.files?input.files.length:-1});}catch(e){return JSON.stringify({ok:false,err:String(e)});}})(` + jsString(encoded) + `,` + jsString(mimeType) + `,` + jsString(name) + `)`
 		var rawResult string
 		if err := p.conn.JS(ctx, expression, false, &rawResult); err != nil {
 			return fmt.Errorf("第 %d 张参考图附加失败：%w", index+1, err)
 		}
 		var result struct {
-			OK bool `json:"ok"`
+			OK       bool `json:"ok"`
+			FilesLen int  `json:"filesLen"`
 		}
 		if err := json.Unmarshal([]byte(rawResult), &result); err != nil || !result.OK {
 			return fmt.Errorf("第 %d 张参考图附加失败，已停止生成", index+1)
 		}
-		deadline := time.Now().Add(15 * time.Second)
+		// Upload progress renders asynchronously. Detect the preview from several
+		// signals in one probe: the composer remove-button/media count and the
+		// uploaded image's alt text (the file name we assigned). React clears
+		// input.files right after reading it, so files.length is not evidence.
+		deadline := time.Now().Add(30 * time.Second)
+		lastDiag := "{}"
 		for {
-			count, err := p.composerAttachmentCount(ctx)
-			if err == nil && count >= index+1 {
-				break
+			var raw string
+			jerr := p.conn.JS(ctx, `(function(){
+				var ov=document.querySelector('[data-testid="hatch-composer-placeholder-overlay"]');
+				var c=ov?(ov.closest('form')||ov.parentElement.parentElement.parentElement):null;
+				var remove=c?Array.from(c.querySelectorAll('button[aria-label]')).filter(function(b){return /remove\s*attachment|移除附件|删除附件/i.test(b.getAttribute('aria-label')||'');}).length:0;
+				var media=c?c.querySelectorAll('img,video').length:0;
+				var alt=document.querySelectorAll('img[alt*="reference_image_"]').length;
+				return JSON.stringify({overlay:!!ov,composer:!!c,remove:remove,media:media,alt:alt});
+			})()`, false, &raw)
+			if jerr == nil {
+				lastDiag = raw
+				var st struct {
+					Overlay  bool `json:"overlay"`
+					Composer bool `json:"composer"`
+					Remove   int  `json:"remove"`
+					Media    int  `json:"media"`
+					Alt      int  `json:"alt"`
+				}
+				if json.Unmarshal([]byte(raw), &st) == nil {
+					count := st.Remove
+					if st.Media > count {
+						count = st.Media
+					}
+					if st.Alt > count {
+						count = st.Alt
+					}
+					if count >= index+1 {
+						break
+					}
+				}
 			}
 			if time.Now().After(deadline) {
-				return fmt.Errorf("参考图上传未确认（%d/%d），已停止生成", count, len(references))
+				return fmt.Errorf("参考图上传未确认（%d/%d, last=%s），已停止生成", index, len(references), lastDiag)
 			}
 			select {
 			case <-ctx.Done():
@@ -425,6 +458,7 @@ func (p *Page) waitAttachment(ctx context.Context, baseline map[string]bool, bas
 	var candidate *attachment
 	candidateSource := ""
 	lastCandidateInfo := "nil"
+	recovered := false
 	for {
 		if err := ctx.Err(); err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
@@ -559,9 +593,44 @@ func (p *Page) waitAttachment(ctx context.Context, baseline map[string]bool, bas
 		} else {
 			textStable = 0
 		}
+		// The page can stop rendering updates while the upstream turn already
+		// finished. Reload the thread once to re-sync the DOM; this never
+		// resubmits the prompt, so it cannot duplicate a paid generation.
+		stallLimit := 120 * time.Second
+		if expect == "video" {
+			stallLimit = 240 * time.Second
+		}
+		if !recovered && candidate == nil && state.Stop && time.Since(lastActivity) > stallLimit && strings.HasPrefix(state.Path, "/thread/") {
+			recovered = true
+			target := strings.TrimRight(p.engine.cfg.SiteURL, "/") + state.Path
+			if navErr := p.conn.Call(ctx, "Page.navigate", map[string]any{"url": target}, nil); navErr == nil {
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(3 * time.Second):
+				}
+				lastActivity = time.Now()
+				continue
+			}
+		}
 		// The turn is over but no usable media appeared: fail clearly instead of
 		// waiting out the whole generation budget and reporting a bare timeout.
 		if expect == "image" && !state.Stop && candidate == nil && time.Since(lastActivity) > 45*time.Second {
+			// Re-sync the DOM once: the turn may have finished while the page
+			// stopped rendering the attachment. This costs no new generation.
+			if !recovered && strings.HasPrefix(state.Path, "/thread/") {
+				recovered = true
+				target := strings.TrimRight(p.engine.cfg.SiteURL, "/") + state.Path
+				if navErr := p.conn.Call(ctx, "Page.navigate", map[string]any{"url": target}, nil); navErr == nil {
+					select {
+					case <-ctx.Done():
+						return nil, ctx.Err()
+					case <-time.After(3 * time.Second):
+					}
+					lastActivity = time.Now()
+					continue
+				}
+			}
 			message := "生成已结束但未检测到新图片"
 			if text := cleanModelText(state.Text, 200); text != "" {
 				message += "：" + text
@@ -569,9 +638,24 @@ func (p *Page) waitAttachment(ctx context.Context, baseline map[string]bool, bas
 			diagCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			diag := p.mediaDiagnostics(diagCtx)
 			cancel()
-			return nil, errors.New(message + diagnosticSuffix(diag))
+			// The first attempt produced nothing, so one retry cannot duplicate
+			// a paid result.
+			return nil, &protocol.UpstreamError{Operation: "generate", Retryable: true, Message: message + diagnosticSuffix(diag)}
 		}
 		if expect == "video" && !state.Stop && candidate == nil && time.Since(lastActivity) > 120*time.Second {
+			if !recovered && strings.HasPrefix(state.Path, "/thread/") {
+				recovered = true
+				target := strings.TrimRight(p.engine.cfg.SiteURL, "/") + state.Path
+				if navErr := p.conn.Call(ctx, "Page.navigate", map[string]any{"url": target}, nil); navErr == nil {
+					select {
+					case <-ctx.Done():
+						return nil, ctx.Err()
+					case <-time.After(3 * time.Second):
+					}
+					lastActivity = time.Now()
+					continue
+				}
+			}
 			message := "生成已结束但未检测到视频附件"
 			if text := cleanModelText(state.Text, 200); text != "" {
 				message += "：" + text
@@ -579,7 +663,7 @@ func (p *Page) waitAttachment(ctx context.Context, baseline map[string]bool, bas
 			diagCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			diag := p.mediaDiagnostics(diagCtx)
 			cancel()
-			return nil, errors.New(message + "（官方页面可能只返回了分享页/静帧）" + diagnosticSuffix(diag))
+			return nil, &protocol.UpstreamError{Operation: "generate", Retryable: true, Message: message + "（官方页面可能只返回了分享页/静帧）" + diagnosticSuffix(diag)}
 		}
 		if expect == "video" && seenStop && !state.Stop &&
 			strings.HasSuffix(strings.TrimRight(state.Path, "/"), "/thread/new") &&
@@ -883,6 +967,14 @@ func retryableBeforeSubmit(err error) bool {
 	return IsRetryable(staged.err)
 }
 
+// retryableGeneration marks a turn that finished without producing any media.
+// waitAttachment only raises it after re-syncing the DOM, so a retry cannot
+// duplicate a paid result.
+func retryableGeneration(err error) bool {
+	var upstream *protocol.UpstreamError
+	return errors.As(err, &upstream) && upstream.Retryable
+}
+
 func (e *Engine) generationTimeout(expect string) time.Duration {
 	timeout := e.cfg.ImageTimeout
 	if expect == "video" {
@@ -923,7 +1015,10 @@ func (e *Engine) Generate(ctx context.Context, credentials protocol.AccountCrede
 			return result, updated, nil
 		}
 		lastErr = returnErr
-		if ctx.Err() != nil || !retryableBeforeSubmit(returnErr) {
+		// Pre-submit failures are retried freely. A finished turn with no media
+		// (confirmed by a DOM re-sync) may also retry once: nothing was produced,
+		// so the retry cannot duplicate a paid result.
+		if ctx.Err() != nil || (!retryableBeforeSubmit(returnErr) && !retryableGeneration(returnErr)) {
 			return nil, updated, returnErr
 		}
 		select {

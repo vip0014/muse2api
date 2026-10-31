@@ -495,9 +495,11 @@ func (s *Server) static(w http.ResponseWriter, r *http.Request) {
 	http.ServeFileFS(w, r, sub, path)
 }
 func (s *Server) processTask(ctx context.Context, t model.Task) (task.Result, error) {
-	acquireCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	lease, err := s.pool.Acquire(acquireCtx)
-	cancel()
+	// Wait for a free account for as long as the task lives. The pool returns
+	// immediately when no eligible account exists; a busy account is a
+	// temporary condition and a queued task must not fail after a fixed
+	// short timeout while the single browser account is still generating.
+	lease, err := s.pool.Acquire(ctx)
 	if err != nil {
 		return task.Result{}, err
 	}
