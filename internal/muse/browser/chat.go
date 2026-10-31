@@ -34,9 +34,12 @@ const pollChatJS = `(function(){
 		var s=getComputedStyle(e);
 		return s.visibility!=='hidden'&&s.display!=='none'&&parseFloat(s.opacity||'1')>0;
 	};
-	var stop=visible(document.querySelector('[data-testid="hatch-composer-stop-button"]'))
+	// A mounted-but-disabled stop control is a leftover of a finished turn,
+	// not evidence that generation is still running.
+	var usable=function(b){return visible(b)&&!b.disabled&&b.getAttribute('aria-disabled')!=='true';};
+	var stop=usable(document.querySelector('[data-testid="hatch-composer-stop-button"]'))
 		||[...document.querySelectorAll('button[aria-label],[role=button][aria-label]')].some(function(b){
-			return visible(b)&&/stop|停止/i.test(b.getAttribute('aria-label')||'');
+			return usable(b)&&/stop|停止/i.test(b.getAttribute('aria-label')||'');
 		});
 	return JSON.stringify({cnt:nonEmpty.length,total:bs.length,txt:txt,stop:stop,path:location.pathname||''});
 })()`

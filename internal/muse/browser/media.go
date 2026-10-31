@@ -422,13 +422,22 @@ func (p *Page) waitAttachment(ctx context.Context, baseline map[string]bool, bas
 	lastActivity := time.Now()
 	lastCount, lastAttachments, lastStop, lastPath := -1, -1, false, ""
 	started := time.Now()
+	var candidate *attachment
+	candidateSource := ""
+	lastCandidateInfo := "nil"
 	for {
 		if err := ctx.Err(); err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
+				// A completed result may already be on screen when the generation
+				// deadline fires. Extraction has its own reserve budget, so return
+				// the attachment instead of discarding a finished generation.
+				if candidate != nil && candidateSource != "" {
+					return candidate, nil
+				}
 				diagCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 				diag := p.mediaDiagnostics(diagCtx)
 				cancel()
-				return nil, fmt.Errorf("等待生成超时（stop=%v, bubbles=%d, attachments=%d, text=%q%s）: %w", lastStop, lastCount, lastAttachments, cleanModelText(lastStateText, 80), diagnosticSuffix(diag), err)
+				return nil, fmt.Errorf("等待生成超时（stop=%v, bubbles=%d, attachments=%d, candidate=%s, text=%q%s）: %w", lastStop, lastCount, lastAttachments, lastCandidateInfo, cleanModelText(lastStateText, 80), diagnosticSuffix(diag), err)
 			}
 			return nil, err
 		}
@@ -450,14 +459,21 @@ func (p *Page) waitAttachment(ctx context.Context, baseline map[string]bool, bas
 		if expect == "video" {
 			matching = selectVideoAttachments(attachments)
 		}
-		var candidate *attachment
-		source := ""
+		candidate = nil
+		candidateSource = ""
 		if len(matching) > 0 {
 			item := matching[len(matching)-1]
-			source = mediaSource(item, expect)
-			if source != "" && !baseline[source] {
+			src := mediaSource(item, expect)
+			if src != "" && !baseline[src] {
 				candidate = &item
+				candidateSource = src
 			}
+		}
+		source := candidateSource
+		if candidate != nil {
+			lastCandidateInfo = fmt.Sprintf("pres=%v video=%v %dx%d", candidate.Presentation, candidate.HasVideo, candidate.Width, candidate.Height)
+		} else {
+			lastCandidateInfo = "nil"
 		}
 		state, err := p.chatState(ctx)
 		if err != nil {
@@ -492,15 +508,21 @@ func (p *Page) waitAttachment(ctx context.Context, baseline map[string]bool, bas
 				return candidate, nil
 			}
 		} else if candidate != nil && state.Stop {
-			// Some UI builds keep a disabled stop control mounted. A large media
-			// source that has not changed for six seconds is still a reliable
-			// final-image signal; a small/zero-size placeholder is ignored.
+			// Some UI builds keep a stale stop control mounted after the turn
+			// ended, and headless Chromium frequently reports
+			// videoWidth/videoHeight 0 until a frame is decoded. Presentation
+			// containers are the trusted result source, so size must not gate
+			// acceptance there; a stable source for ~3.6s is enough.
 			if source == stableSrc {
 				stableCount++
 			} else {
 				stableSrc, stableCount = source, 0
 			}
-			if stableCount >= 10 && candidate.Width >= 256 && candidate.Height >= 256 {
+			trusted := candidate.Width >= 256 && candidate.Height >= 256
+			if candidate.Presentation && candidate.HasVideo {
+				trusted = true
+			}
+			if stableCount >= 6 && trusted {
 				return candidate, nil
 			}
 		}
