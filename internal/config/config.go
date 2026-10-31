@@ -8,7 +8,6 @@ import (
 	"net"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -43,12 +42,6 @@ type Config struct {
 	PublicMedia              bool
 	LogLevel                 string
 	ProxyURL                 string
-	BrowserEnabled           bool
-	Chromium                 string
-	CDPPort                  int
-	LoginWait                time.Duration
-	ProfileDir               string
-	DownloadDir              string
 }
 
 func Load(homeOverride string) (Config, error) {
@@ -113,11 +106,6 @@ func Load(homeOverride string) (Config, error) {
 	if c.AdminUsername == "" {
 		c.AdminUsername = "admin"
 	}
-	c.BrowserEnabled = boolEnvDefault("MUSE2API_BROWSER", true)
-	c.Chromium = detectChromium()
-	profileRoot := env("MUSE2API_PROFILE_ROOT", filepath.Join(c.DataDir(), "chromium"))
-	c.ProfileDir = env("MUSE2API_PROFILE_DIR", filepath.Join(profileRoot, "generate"))
-	c.DownloadDir = env("MUSE2API_DOWNLOAD_DIR", filepath.Join(c.DataDir(), "downloads"))
 	if c.Port, err = intEnv("MUSE2API_PORT", 18610, 1, 65535); err != nil {
 		return Config{}, err
 	}
@@ -137,12 +125,6 @@ func Load(homeOverride string) (Config, error) {
 		return Config{}, err
 	}
 	if c.HTTPTimeout, err = secondsEnv("MUSE2API_HTTP_TIMEOUT", 20); err != nil {
-		return Config{}, err
-	}
-	if c.CDPPort, err = intEnv("MUSE2API_CDP_PORT", 19210, 1, 65535); err != nil {
-		return Config{}, err
-	}
-	if c.LoginWait, err = secondsEnv("MUSE2API_LOGIN_WAIT", 60); err != nil {
 		return Config{}, err
 	}
 	ttlSeconds, err := intEnv("MUSE2API_SESSION_TTL", 12*3600, 300, 7*24*3600)
@@ -295,20 +277,6 @@ func boolEnvDefault(k string, fallback bool) bool {
 		return fallback
 	}
 	return boolEnv(k)
-}
-func detectChromium() string {
-	if configured := strings.TrimSpace(os.Getenv("MUSE2API_CHROMIUM")); configured != "" {
-		return configured
-	}
-	for _, candidate := range []string{"chromium", "chromium-browser", "google-chrome", "google-chrome-stable", `C:\Program Files\Google\Chrome\Application\chrome.exe`, `C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`} {
-		if _, err := os.Stat(candidate); err == nil {
-			return candidate
-		}
-		if path, err := exec.LookPath(candidate); err == nil {
-			return path
-		}
-	}
-	return "chromium"
 }
 func intEnv(k string, d, min, max int) (int, error) {
 	v := os.Getenv(k)

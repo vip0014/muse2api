@@ -20,7 +20,7 @@ it('loads the lazy dashboard after an authenticated session', async () => {
       return new Response(JSON.stringify({
         status: 'ok', version: '2.1.0', account_stats: {}, task_stats: {},
         tasks: [], media_count: 0, events: [], base_url: '/v1',
-        browser_enabled: true, browser_running: false,
+        protocol: 'hatch-noise-protocol',
       }), { status: 200, headers: { 'Content-Type': 'application/json' } })
     }
     return new Response('{}', { status: 200 })

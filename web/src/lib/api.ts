@@ -5,8 +5,19 @@ export class APIError extends Error {
 export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers)
   if (init.body && !(init.body instanceof FormData) && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json')
+  // Never let the UI spin forever on a slow backend path (browser startup,
+  // generation wait, quota refresh queued behind other work).
+  const controller = new AbortController()
+  const timer = window.setTimeout(() => controller.abort(), 60000)
   let response: Response
-  try { response = await fetch(path, { ...init, credentials: 'same-origin', headers }) } catch { throw new APIError('无法连接服务，请检查后端是否运行', 0) }
+  try {
+    response = await fetch(path, { ...init, credentials: 'same-origin', headers, signal: init.signal ?? controller.signal })
+  } catch {
+    if (controller.signal.aborted) throw new APIError('请求超时，请稍后重试', 0)
+    throw new APIError('无法连接服务，请检查后端是否运行', 0)
+  } finally {
+    window.clearTimeout(timer)
+  }
   const requestId = response.headers.get('X-Request-ID') ?? undefined
   const text = await response.text()
   let body: unknown = null

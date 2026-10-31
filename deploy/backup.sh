@@ -1,7 +1,6 @@
 #!/bin/sh
 # Create a consistent host-side archive of data. The service is stopped while
-# the archive is created and started again on exit. Chromium profiles and
-# downloads are excluded: they are rebuildable and contain session traces.
+# the archive is created and started again on exit.
 set -eu
 umask 077
 
@@ -47,8 +46,6 @@ if [ "$was_running" -eq 0 ]; then
 fi
 
 tar \
-    --exclude='./data/chromium' \
-    --exclude='./data/downloads' \
     -czf "$archive" ./data
 
 chmod 600 "$archive"

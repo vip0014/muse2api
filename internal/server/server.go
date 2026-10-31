@@ -53,27 +53,12 @@ func New(cfg config.Config, store *storage.Store, driver protocol.Driver, log *s
 	s.autoCheck = newAutoChecker()
 	s.autoCheck.wg.Add(1)
 	go s.autoCheckWorker()
-	if warmer, ok := driver.(interface{ Warm(context.Context) error }); ok && cfg.BrowserEnabled {
-		s.autoCheck.wg.Add(1)
-		go func() {
-			defer s.autoCheck.wg.Done()
-			ctx, cancel := context.WithTimeout(s.autoCheck.ctx, 90*time.Second)
-			defer cancel()
-			if err := warmer.Warm(ctx); err != nil {
-				if ctx.Err() == nil {
-					log.Warn("浏览器预热失败", "error", err)
-				}
-			} else {
-				log.Info("浏览器预热完成")
-			}
-		}()
-	}
 	return s
 }
 
 // Close bounds task shutdown. A provider that ignores context cannot hold the
-// process forever, but the driver still gets a bounded chance to release its
-// Chromium process instead of being skipped entirely.
+// process forever, but the driver still gets a bounded chance to close its
+// gateway connection instead of being skipped entirely.
 func (s *Server) Close() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -439,29 +424,13 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"status": "ok", "time": time.Now().Unix(), "version": "2.1.0"})
 }
 
-type browserStatus interface {
-	BrowserRunning() bool
-}
-
-func (s *Server) browserRunning() bool {
-	driver, ok := s.driver.(browserStatus)
-	return ok && driver.BrowserRunning()
-}
-
-func (s *Server) protocolName() string {
-	if s.cfg.BrowserEnabled {
-		return "go-chromium-cdp"
-	}
-	return "native-http-unavailable"
-}
-
 func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 	stats := s.store.AccountStats()
 	status := "ready"
 	if stats["enabled"] == 0 {
 		status = "no_account"
 	}
-	writeJSON(w, 200, map[string]any{"status": status, "accounts": stats["enabled"], "browser_running": s.browserRunning(), "browser_enabled": s.cfg.BrowserEnabled, "protocol": s.protocolName()})
+	writeJSON(w, 200, map[string]any{"status": status, "accounts": stats["enabled"], "protocol": "hatch-noise-protocol"})
 }
 func (s *Server) static(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {

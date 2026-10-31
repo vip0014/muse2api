@@ -9,7 +9,7 @@ User=muse
 Group=muse
 WorkingDirectory=/opt/muse2api
 Environment=MUSE2API_HOME=/opt/muse2api
-Environment=HOME=/opt/muse2api/data/chromium
+Environment=HOME=/opt/muse2api/data
 ExecStart=/opt/muse2api/bin/muse2api
 Restart=on-failure
 RestartSec=5

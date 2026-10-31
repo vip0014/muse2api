@@ -98,5 +98,5 @@ func (e *UpstreamError) Error() string {
 	return e.Operation + ": " + e.Message
 }
 func Unavailable(operation string) error {
-	return fmt.Errorf("%s: %w；需要可用的 Chromium/CDP 执行能力，请确认 MUSE2API_BROWSER=1 且浏览器可用", operation, ErrCapabilityUnavailable)
+	return fmt.Errorf("%s: %w；当前协议执行器未实现该操作", operation, ErrCapabilityUnavailable)
 }

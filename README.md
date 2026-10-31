@@ -6,7 +6,7 @@
 
 <p align="center">
   <b>把 Muse 的对话、图片和视频能力，接成一套 OpenAI 兼容 API</b><br>
-  自托管 · 多账号轮换 · Chromium/CDP · 带一个能干活的 Web 后台
+  自托管 · 多账号轮换 · 纯协议（Noise + protobuf）· 带一个能干活的 Web 后台
 </p>
 
 <p align="center">
@@ -25,7 +25,7 @@
 
 ## 👋 这玩意儿是干什么的
 
-一句话：它不是 Muse 官方 API，而是一个自己托管的小网关。后端用 Go，后台用 React，Chromium 在后台打开 Muse 页面干活；对外给你一套 `/v1` 接口，现成的 OpenAI 客户端、脚本或者自己的小工具改个 Base URL 就能接。
+一句话：它不是 Muse 官方 API，而是一个自己托管的小网关。后端用 Go，后台用 React。生成走**纯协议**：直接和 Muse 的 Noise 加密 WebSocket + protobuf 网关对话，不需要浏览器、也不依赖页面结构。对外给你一套 `/v1` 接口，现成的 OpenAI 客户端、脚本或者自己的小工具改个 Base URL 就能接。
 
 项目基于 [czg86389-hub/muse2api](https://github.com/czg86389-hub/muse2api) 的 Python 版本，用 Go + React 重写；`18610` 端口、Bearer Key、`/v1` 路径和 `./data` 数据目录这些使用习惯保持不变。
 
@@ -33,8 +33,8 @@
 
 | 能力 | 现在的情况 |
 |---|---|
-| 💬 **对话** | `/v1/chat/completions`、`/v1/responses`，普通返回和 SSE 都支持。Responses 支持文本。 |
-| 🎨 **图片** | 文生图、参考图编辑；同步接口和异步任务都能用。支持最多 4 张有序参考图。 |
+| 💬 **对话** | `/v1/chat/completions`、`/v1/responses`，普通返回和逐字 SSE 都支持。Responses 支持文本。 |
+| 🎨 **图片** | 文生图、参考图编辑；同步接口和异步任务都能用。支持最多 4 张有序参考图（协议内联上传）。 |
 | 🎬 **视频** | 一次生成一个片段，大约 10 秒、720p；任务里会记录实际时长和分辨率。支持 `images` 多图参考，第一张作为主要起始画面。 |
 | 🔁 **账号池** | 多个账号轮着用，单账号限制并发，任务排队有上限；导入后自动检测会话、刷新额度。 |
 | 🧷 **幂等** | 图片和视频任务认 `Idempotency-Key`，客户端重试不会重复提交上游。 |
@@ -56,8 +56,8 @@
 ### 先看环境
 
 - **Docker**：Linux、Docker Engine 24+、Docker Compose v2。
-- **源码**：Go 1.24+、Node 24+、Chromium/Chrome，最好有 `make`；没有就手动敲构建命令。Node 只在构建前端时用。
-- 机器得能启动 Chromium。Docker 镜像里已经带了，源码跑的话自己装。
+- **源码**：Go 1.24+、Node 24+，最好有 `make`；没有就手动敲构建命令。Node 只在构建前端时用。
+- 不需要 Chromium/Chrome：生成走上游 Noise WebSocket，Docker 镜像也不再安装浏览器。
 
 ### 先把代码放 /opt
 
@@ -131,7 +131,7 @@ export COMPOSE_FILE=docker-compose.yml:deploy/docker-compose.secrets.yml
 ```bash
 cd /opt/muse2api
 cp .env.example .env
-# 编辑 .env；如果程序找不到浏览器，加一行 MUSE2API_CHROMIUM=/usr/bin/chromium
+# 编辑 .env，填好 Key、管理员密码和凭据加密 Key 即可
 make build
 
 mkdir -p data
@@ -165,7 +165,7 @@ sudo systemctl status muse2api
 
 源码跑的时候别执行 Docker 那套 `sudo make init-data`，它会把 `data/` 改成 UID 10001；源码部署的数据目录归运行服务的用户。
 
-默认会读 `/opt/muse2api/.env`。要是服务用户对项目目录没有执行权限，或者 Chromium 不在 `PATH` 里，就分别改目录权限、设 `MUSE2API_CHROMIUM`。不想新建 `muse` 用户也行，把 `deploy/muse2api.service` 里的 `User`/`Group` 换成现有用户，并让这个用户拥有 `data/` 和 `.env`。
+默认会读 `/opt/muse2api/.env`。要是服务用户对项目目录没有执行权限，改目录权限即可。不想新建 `muse` 用户也行，把 `deploy/muse2api.service` 里的 `User`/`Group` 换成现有用户，并让这个用户拥有 `data/` 和 `.env`。
 
 ### 放到公网
 
@@ -314,10 +314,28 @@ curl http://127.0.0.1:18610/v1/videos \
 | `MUSE2API_MAX_UPLOAD_BYTES` | `41943040` | 请求体上限；24 MiB 原图转 base64 后需要更宽的上限，改大时记得同步改 Nginx 的 `client_max_body_size` |
 | `MUSE2API_REF_IMAGE_LOCAL_FILES` | `0` | 设为 `1` 才允许参考图读取服务器本地文件路径 |
 | `MUSE2API_REF_IMAGE_PRIVATE_FETCH` | `0` | 设为 `1` 才允许参考图下载私网/本机 URL；默认只允许公网并逐跳检查重定向 |
-| `MUSE2API_BROWSER` | `1` | 设成 `0` 就不启动 Chromium，对话、生成和额度都用不了 |
 | `MUSE2API_LOG_LEVEL` | `info` | 日志级别 |
 
 其余的超时、并发、队列、目录这些，都在 `.env.example` 里。注意 `.env.example` 里的占位值会被程序拒绝，别直接拿来启动。
+
+### 协议实现
+
+生成链路和 Muse 自己的 web 客户端一致：
+
+```text
+HTTP bootstrap: /api/session → VM 唤醒 → /api/hatch/token → /api/hatch/noise-notary-token
+WebSocket:      wss://hatch.metaaivm.com/v1/noise?vm_id=...&auth_token=...&app_id=hatch-web
+加密:           Noise_XX_25519_AESGCM_SHA256（X25519 + HKDF + AES-GCM，4+8 字节 big-endian nonce）
+帧:             NoiseTransportFrame → ServiceFrame → ApplicationRequest/ApplicationResponse
+应用层:         /api/nodes/register → /client/register-capabilities
+                POST /chat/subscribe（增量）→ POST /chat/stream → GET /chat/history
+                媒体从 /media/raw 或 /fs/raw 下载
+额度:           POST /settings（Next-Action: fetchSubscriptionAction，React Flight 响应）
+```
+
+已用真实账号验收：文生图、参考图编辑、文生视频、混合并发都能完成，媒体正常落盘；对话按上游 `chat.subscribe` 的增量逐字转发为 SSE；视频结果的时长和分辨率从 MP4 元数据解析。
+
+额度刷新也走纯 HTTP：Muse 的设置页通过 Next.js server action `fetchSubscriptionAction` 返回订阅快照（套餐、每周用量、额外额度），后台只发一次 POST，不唤醒 VM、不启动浏览器。action id 会随部署变化，失效时自动扫描设置页加载的脚本重新定位并缓存。
 
 ### 参考图安全
 
@@ -340,16 +358,15 @@ MUSE2API_REF_IMAGE_PRIVATE_FETCH=1
 
 ## 🕳️ 几个坑，提前说
 
-- 它不是纯 HTTP 协议实现。对话、生图、视频、额度都靠 Chromium 打开 Muse 页面，页面改版后选择器可能要跟着修。
 - `gpt-4o`、`claude-sonnet-4` 会落到 `muse-spark`，`dall-e-3` 落到 `muse-image`，`sora` 落到 `muse-video`。这些只是兼容别名，不代表对应的官方模型能力。
-- 浏览器页面操作目前是全局串行的。本地任务并发不等于上游并行生成。
+- 上游一个账号只有一个 VM，会话是全局串行的。本地任务并发不等于上游并行生成。
 - 视频只能单片段，大约 10 秒、720p；`duration` 不控制上游；比例只能靠提示词；长视频自己分段。
 - 参考图默认只接受 data URL、base64 和公网 http(s) URL；本地文件和私网地址默认拒绝，需要时用上面两个开关显式放开。参考图超限、MIME 不对或下载失败会在创建任务前直接返回 400。
 - 账号必填 Cookie 只有 `hatch_sess` 和 `hatch_vml`；`hatch_native_auth_device` 是可选项。
 - 服务重启时，遗留的排队/运行中任务会标成 `unknown`，不会自动重放，避免重复扣费。管理员会话保存在内存，重启后要重新登录。
 - 后台的备份恢复要重启服务，当前进程不会热加载恢复后的数据。
 - 兼容旧版 `accounts.json/tasks.json`；首次启动会把旧账号加密迁移。升级前先备份 `data/` 和加密 Key。
-- 别把 CDP 端口 `19210` 发布到宿主机。`data/chromium` 里的 profile 和生成的媒体，都按敏感数据对待。
+- `data/` 里的账号密文和生成的媒体，都按敏感数据对待。
 
 ## 🧯 遇到问题先看这几条
 
@@ -359,7 +376,7 @@ Cookie 过期了。重新在自己的浏览器里登录 Muse，再更新账号�
 
 **接口返回 503，说能力不可用？**
 
-先确认 `MUSE2API_BROWSER=1`，再看容器日志里的 Chromium / CDP 错误。`MUSE2API_BROWSER=0` 是主动降级，不是 bug。
+看日志里的 `/api/session`、`/api/hatch/token` 和 Noise 握手错误。常见原因：Cookie 过期（401）、`hatch_vml` 失效（403，重新导入账号即可）、VM 唤醒超时。
 
 **Nginx 后面的 SSE 不实时？**
 
@@ -393,7 +410,7 @@ make backup
 sudo env MUSE2API_SYSTEMD_UNIT=muse2api make backup
 ```
 
-脚本会短暂停服务，打包 `data/`，默认跳过能重建的 `data/chromium` 和 `data/downloads`。归档默认放在项目下的 `backups/`。
+脚本会短暂停服务，打包 `data/`。归档默认放在项目下的 `backups/`。
 
 ### 恢复
 
@@ -441,7 +458,7 @@ sudo systemctl restart muse2api
 
 ## 🛠️ 本地开发
 
-要 Go 1.24+、Node 24+，机器上还得有 Chromium/Chrome。
+要 Go 1.24+、Node 24+，不需要 Chromium/Chrome。
 
 ```bash
 make test
@@ -463,8 +480,9 @@ Vite 会代理到 `127.0.0.1:18610`。
 ```text
 cmd/muse2api/            程序入口
 internal/server/         HTTP 服务、管理 API、任务编排
-internal/muse/browser/   Chromium/CDP 驱动、页面操作、媒体提取
-internal/muse/protocol/  驱动接口与原生 HTTP 兜底
+internal/muse/capabilities/  上游能力声明
+internal/muse/protocol/  驱动接口、提示词模板
+internal/muse/protocol/hatch/  纯协议驱动：Noise XX、protobuf 帧、聊天与媒体下载
 internal/refimage/       参考图解析、大小/MIME 校验、SSRF 防护
 internal/storage/        AES-GCM 账号存储、任务与事件持久化
 internal/scheduler/      账号池与并发调度
@@ -478,7 +496,7 @@ docs/screenshots/        README 截图
 
 - 只导自己的账号。不要批量注册、转卖额度，也别拿它绕上游限制。
 - 管理员密码、API Key、`MUSE2API_CREDENTIAL_KEY` 分开备份。加密 Key 丢了，旧账号 Cookie 就回不来了。
-- 生产环境上 HTTPS。CDP 端口 `19210` 只在容器内监听，别映射到宿主机。
+- 生产环境上 HTTPS。服务不启动浏览器，也没有 CDP 端口需要暴露。
 - `data/` 里有账号密文、媒体和浏览器 profile，别提交到 Git，也别扔进公开备份。
 - 参考图的本地文件和私网开关默认关闭；只有在确认调用方可信时才打开。
 

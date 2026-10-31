@@ -27,7 +27,7 @@ gid=${MUSE2API_GID:-$(read_env MUSE2API_GID)}
 uid=${uid:-10001}
 gid=${gid:-10001}
 
-for dir in "$data" "$data/media" "$data/backups" "$data/chromium/generate" "$data/downloads"; do
+for dir in "$data" "$data/media" "$data/backups"; do
     mkdir -p "$dir"
     chmod 700 "$dir"
 done

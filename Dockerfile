@@ -20,13 +20,13 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     go build -trimpath -ldflags="-s -w" -o /out/muse2api ./cmd/muse2api
 
 FROM alpine:3.22.2
-RUN apk add --no-cache ca-certificates tzdata chromium font-noto-cjk && addgroup -g 10001 muse && adduser -D -H -u 10001 -G muse muse
+RUN apk add --no-cache ca-certificates tzdata && addgroup -g 10001 muse && adduser -D -H -u 10001 -G muse muse
 WORKDIR /app
 COPY --from=go-build /out/muse2api /usr/local/bin/muse2api
-RUN mkdir -p /app/data/media /app/data/backups /app/data/chromium/generate /app/data/downloads \
+RUN mkdir -p /app/data/media /app/data/backups \
     && chown -R muse:muse /app \
     && chmod -R go-rwx /app/data
-ENV HOME=/app/data/chromium MUSE2API_HOME=/app MUSE2API_HOST=0.0.0.0 MUSE2API_PORT=18610 MUSE2API_BROWSER=1 MUSE2API_CHROMIUM=/usr/bin/chromium MUSE2API_CDP_PORT=19210
+ENV HOME=/app/data MUSE2API_HOME=/app MUSE2API_HOST=0.0.0.0 MUSE2API_PORT=18610
 USER 10001:10001
 VOLUME ["/app/data"]
 EXPOSE 18610

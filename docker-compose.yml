@@ -5,7 +5,7 @@ services:
       dockerfile: Dockerfile
     image: muse2api:2.1.0
     container_name: muse2api
-    # tini reaps Chromium child processes and forwards signals cleanly.
+    # tini forwards signals cleanly to the Go process.
     init: true
     restart: unless-stopped
     # The app bounds HTTP shutdown (20s), task shutdown (10s) and driver close
@@ -43,13 +43,6 @@ services:
       MUSE2API_HTTP_TIMEOUT: "${MUSE2API_HTTP_TIMEOUT:-20}"
       MUSE2API_MAX_UPLOAD_BYTES: "${MUSE2API_MAX_UPLOAD_BYTES:-41943040}"
       MUSE2API_MAX_MEDIA_BYTES: "${MUSE2API_MAX_MEDIA_BYTES:-536870912}"
-      MUSE2API_BROWSER: "${MUSE2API_BROWSER:-1}"
-      MUSE2API_CHROMIUM: /usr/bin/chromium
-      MUSE2API_CDP_PORT: "${MUSE2API_CDP_PORT:-19210}"
-      MUSE2API_LOGIN_WAIT: "${MUSE2API_LOGIN_WAIT:-60}"
-      MUSE2API_PROFILE_ROOT: "${MUSE2API_PROFILE_ROOT:-}"
-      MUSE2API_PROFILE_DIR: "${MUSE2API_PROFILE_DIR:-}"
-      MUSE2API_DOWNLOAD_DIR: "${MUSE2API_DOWNLOAD_DIR:-}"
       MUSE2API_CORS_ORIGINS: "${MUSE2API_CORS_ORIGINS:-}"
       MUSE2API_PUBLIC_MEDIA: "${MUSE2API_PUBLIC_MEDIA:-0}"
       MUSE2API_LOG_LEVEL: "${MUSE2API_LOG_LEVEL:-info}"
@@ -61,14 +54,14 @@ services:
       - ./data:/app/data
     read_only: true
     tmpfs:
-      # Chromium/crashpad and video decoding use temp files; keep the mount
-      # bounded but large enough for concurrent page/media work.
+      # Media downloads stage temp files; keep the mount bounded but large
+      # enough for concurrent transfers.
       - /tmp:size=64m,mode=1777
     security_opt:
       - no-new-privileges:true
     cap_drop:
       - ALL
-    # Chromium keeps many sockets/pipes open per page.
+    # The gateway keeps WebSocket connections and media transfers open.
     ulimits:
       nofile:
         soft: 65536

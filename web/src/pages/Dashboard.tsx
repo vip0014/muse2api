@@ -55,7 +55,6 @@ export default function Dashboard() {
   const accounts = data.account_stats ?? {}
   const tasks = data.task_stats ?? {}
   const allAccounts = accountQuery.data?.accounts ?? []
-  const browser = data.browser_enabled ? (data.browser_running ? '已连接' : '待启动') : '已禁用'
   const failed = data.tasks.filter(task => task.status === 'failed').length
   const activeAccounts = accounts.active ?? 0
   const totalAccounts = accounts.total ?? 0
@@ -75,7 +74,6 @@ export default function Dashboard() {
     attention.push({ id: `task-${task.id}`, tone: 'danger', title: task.prompt || '生成任务失败', detail: task.error || '任务执行失败，查看错误后重试。', meta: '任务', to: `/tasks?focus=${encodeURIComponent(task.id)}` })
   }
   if ((tasks.queued ?? 0) > 0) attention.push({ id: 'queue', tone: 'info', title: `${tasks.queued} 个任务在排队`, detail: '队列正在等待可用账号或并发槽位。', meta: '任务', to: '/tasks?status=queued' })
-  if (data.browser_enabled === false) attention.push({ id: 'browser-off', tone: 'info', title: '浏览器运行时已禁用', detail: '当前只能查看数据；需要生成任务时请在服务端启用浏览器运行时。', meta: '运行时', to: '/settings' })
 
   const visibleAttention = attention.slice(0, 7)
   const imageRate = percent(tasks.image_succeeded ?? 0, tasks.image_total ?? 0)
@@ -93,7 +91,7 @@ export default function Dashboard() {
       <div className="command-band-lead">
         <span className="live-pill"><span className={`live-dot ${awaiting || failed > 0 ? 'warn' : ''}`} />{awaiting ? '待配置' : failed > 0 ? `${failed} 项失败` : '运行中'}</span>
         <h2>{statusLabel}</h2>
-        <p>Chromium {browser} · <span className="mono">v{data.version}</span> · 每 15 秒同步</p>
+        <p>纯协议（Noise）· <span className="mono">v{data.version}</span> · 每 15 秒同步</p>
       </div>
       <div className="command-band-stats">
         <div className="band-metric"><span>可用账号</span><strong>{activeAccounts}<small>/ {totalAccounts}</small></strong></div>

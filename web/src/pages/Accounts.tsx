@@ -84,7 +84,13 @@ export default function Accounts({ initialSearch = '', initialStatus = '', initi
   }
   const refreshQuota = (account: Account) => {
     setMessage(''); setErrorMessage('')
-    action.mutate({ path: `/admin/accounts/${account.id}/quota` }, { onSuccess: () => setMessage('额度已同步') })
+    action.mutate({ path: `/admin/accounts/${account.id}/quota` }, {
+      onSuccess: result => {
+        const value = result as { busy?: boolean; message?: string } | null
+        if (value?.busy) { setMessage(''); setErrorMessage(value.message ?? '正在执行生成任务，已显示上次额度') }
+        else { setMessage('额度已同步') }
+      },
+    })
   }
   const bulk = (operation: string) => action.mutate({ path: '/admin/accounts/bulk', body: { ids: [...selectedIds], action: operation } }, { onSuccess: () => setSelectedIds(new Set()) })
   const toggleEnabled = (account: Account) => action.mutate({ path: `/admin/accounts/${account.id}`, method: 'PATCH', body: { enabled: !account.enabled } })

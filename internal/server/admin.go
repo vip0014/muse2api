@@ -48,7 +48,7 @@ func (s *Server) adminStatus(w http.ResponseWriter, r *http.Request) {
 	for _, task := range rawTasks {
 		recent = append(recent, legacyTask(task))
 	}
-	writeJSON(w, 200, map[string]any{"status": "ok", "version": "2.1.0", "accounts": s.store.ListAccounts(), "account_stats": s.store.AccountStats(), "stats": stats, "tasks": recent, "task_stats": stats, "media_count": s.mediaCount(), "events": s.store.Events(10), "browser_running": s.browserRunning(), "browser_enabled": s.cfg.BrowserEnabled, "base_url": s.cfg.PublicBase + "/v1", "config": publicConfig(s.cfg)})
+	writeJSON(w, 200, map[string]any{"status": "ok", "version": "2.1.0", "accounts": s.store.ListAccounts(), "account_stats": s.store.AccountStats(), "stats": stats, "tasks": recent, "task_stats": stats, "media_count": s.mediaCount(), "events": s.store.Events(10), "protocol": "hatch-noise-protocol", "base_url": s.cfg.PublicBase + "/v1", "config": publicConfig(s.cfg)})
 }
 func (s *Server) listAccounts(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"accounts": s.store.ListAccounts(), "stats": s.store.AccountStats()})
@@ -397,9 +397,13 @@ func mapQuotaError(err error) error {
 	return apierr.New(http.StatusBadGateway, "quota_error", "额度读取失败："+message)
 }
 func (s *Server) quotaAny(w http.ResponseWriter, r *http.Request) {
-	lease, err := s.pool.Acquire(r.Context())
+	// Never hold the request open while a generation lease is occupied; the
+	// admin refresh button must fail fast with a clear message.
+	acquireCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	lease, err := s.pool.Acquire(acquireCtx)
+	cancel()
 	if err != nil {
-		apierr.Write(w, r, apierr.New(http.StatusServiceUnavailable, "account_unavailable", "没有可用账号"))
+		apierr.Write(w, r, apierr.New(http.StatusServiceUnavailable, "account_unavailable", "账号正忙或不可用，请稍后刷新"))
 		return
 	}
 	defer lease.Release()
@@ -563,7 +567,7 @@ func (s *Server) adminModels(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"data": s.driver.Capabilities(r.Context())})
 }
 func publicConfig(c config.Config) map[string]any {
-	return map[string]any{"host": c.Host, "port": c.Port, "public_base": c.PublicBase, "site": c.SiteURL, "concurrency": c.Concurrency, "queue_size": c.QueueSize, "image_timeout": int(c.ImageTimeout.Seconds()), "video_timeout": int(c.VideoTimeout.Seconds()), "chat_timeout": int(c.ChatTimeout.Seconds()), "media_dir": "data/media", "media_retention": "manual", "log_level": c.LogLevel, "credential_encryption": len(c.CredentialKey) == 32, "public_media": c.PublicMedia, "browser_runtime": c.BrowserEnabled, "cdp_port": c.CDPPort, "login_wait": int(c.LoginWait.Seconds()), "admin_username": c.AdminUsername, "session_ttl": int(c.SessionTTL.Seconds()), "trust_proxy": c.TrustProxy, "max_upload_bytes": c.MaxUploadBytes, "ref_image_local_files": c.RefImageLocalFiles, "ref_image_private_fetch": c.RefImagePrivateFetch}
+	return map[string]any{"host": c.Host, "port": c.Port, "public_base": c.PublicBase, "site": c.SiteURL, "concurrency": c.Concurrency, "queue_size": c.QueueSize, "image_timeout": int(c.ImageTimeout.Seconds()), "video_timeout": int(c.VideoTimeout.Seconds()), "chat_timeout": int(c.ChatTimeout.Seconds()), "media_dir": "data/media", "media_retention": "manual", "log_level": c.LogLevel, "credential_encryption": len(c.CredentialKey) == 32, "public_media": c.PublicMedia, "admin_username": c.AdminUsername, "session_ttl": int(c.SessionTTL.Seconds()), "trust_proxy": c.TrustProxy, "max_upload_bytes": c.MaxUploadBytes, "ref_image_local_files": c.RefImageLocalFiles, "ref_image_private_fetch": c.RefImagePrivateFetch}
 }
 func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"config": publicConfig(s.cfg), "version": "2.1.0", "restart_required_for": "MUSE2API_* 环境变量"})

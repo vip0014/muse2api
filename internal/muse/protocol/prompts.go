@@ -1,11 +1,20 @@
-package browser
+package protocol
 
 import (
 	"fmt"
 	"strings"
-
-	"muse2api/internal/muse/protocol"
 )
+
+// ReferenceList normalizes a single reference and a reference list.
+func ReferenceList(single string, many []string) []string {
+	if len(many) > 0 {
+		return many
+	}
+	if strings.TrimSpace(single) != "" {
+		return []string{single}
+	}
+	return nil
+}
 
 func containsAny(value string, keys ...string) bool {
 	for _, key := range keys {
@@ -16,18 +25,11 @@ func containsAny(value string, keys ...string) bool {
 	return false
 }
 
-func referenceList(single string, many []string) []string {
-	if len(many) > 0 {
-		return many
-	}
-	if strings.TrimSpace(single) != "" {
-		return []string{single}
-	}
-	return nil
-}
-
-func buildImagePrompt(request protocol.ImageRequest) string {
-	references := referenceList(request.ReferenceImage, request.ReferenceImages)
+// BuildImagePrompt renders the upstream instruction used for image requests.
+// Both the browser and the protocol driver send the same text so results stay
+// consistent across drivers.
+func BuildImagePrompt(request ImageRequest) string {
+	references := ReferenceList(request.ReferenceImage, request.ReferenceImages)
 	hasReference := len(references) > 0
 	prompt := strings.TrimSpace(request.Prompt)
 	parts := []string{}
@@ -64,9 +66,10 @@ func buildImagePrompt(request protocol.ImageRequest) string {
 	return strings.Join(parts, "，")
 }
 
-func buildVideoPrompt(request protocol.VideoRequest) string {
+// BuildVideoPrompt renders the upstream instruction used for video requests.
+func BuildVideoPrompt(request VideoRequest) string {
 	prompt := strings.TrimSpace(request.Prompt)
-	references := referenceList(request.ReferenceImage, request.ReferenceImages)
+	references := ReferenceList(request.ReferenceImage, request.ReferenceImages)
 	hasReference := len(references) > 0
 	ratio := strings.ToLower(strings.TrimSpace(request.AspectRatio + request.Size))
 	shape := "动态视频"
@@ -83,8 +86,6 @@ func buildVideoPrompt(request protocol.VideoRequest) string {
 			prefix = "基于我本次上传的参考图片附件作为第一帧参考图（严禁使用历史图片或任何其他图像，必须严格以我当前刚刚上传的这张图片为起始帧）"
 		}
 	}
-	// Muse currently produces one clip of roughly 10 seconds. Duration is not
-	// an upstream parameter, so it is deliberately not written into the prompt.
 	result := fmt.Sprintf("%s：生成%s：%s", prefix, shape, prompt)
 	if request.Resolution != "" {
 		result += "，画质规格：" + request.Resolution

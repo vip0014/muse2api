@@ -49,8 +49,6 @@ export interface Overview {
   media_count: number
   events: SystemEvent[]
   base_url: string
-  browser_running?: boolean
-  browser_enabled?: boolean
   protocol?: string
 }
-export interface ServiceConfig { host: string; port: number; public_base: string; site: string; concurrency: number; queue_size: number; image_timeout: number; video_timeout: number; chat_timeout: number; media_dir: string; media_retention: string; log_level: string; credential_encryption: boolean; public_media: boolean; browser_runtime: boolean; admin_username?: string; session_ttl?: number; trust_proxy?: boolean; max_upload_bytes?: number; ref_image_local_files?: boolean; ref_image_private_fetch?: boolean }
+export interface ServiceConfig { host: string; port: number; public_base: string; site: string; concurrency: number; queue_size: number; image_timeout: number; video_timeout: number; chat_timeout: number; media_dir: string; media_retention: string; log_level: string; credential_encryption: boolean; public_media: boolean; admin_username?: string; session_ttl?: number; trust_proxy?: boolean; max_upload_bytes?: number; ref_image_local_files?: boolean; ref_image_private_fetch?: boolean }

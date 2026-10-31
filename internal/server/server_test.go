@@ -28,7 +28,7 @@ import (
 type fakeDriver struct{ unavailable bool }
 
 func (f *fakeDriver) Capabilities(context.Context) []capabilities.Capability {
-	return capabilities.Current()
+	return capabilities.Protocol()
 }
 func (f *fakeDriver) Chat(ctx context.Context, r protocol.ChatRequest) (<-chan protocol.ChatEvent, error) {
 	if f.unavailable {

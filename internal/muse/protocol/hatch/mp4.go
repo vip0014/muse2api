@@ -1,4 +1,4 @@
-package browser
+package hatch
 
 import "encoding/binary"
 
@@ -95,8 +95,8 @@ func parseTKHD(payload []byte) (int, int, bool) {
 }
 
 // probeMP4Metadata reads the movie header and the first video track header.
-// It is intentionally best-effort: a malformed or fragmented file returns
-// ok=false and the task simply omits duration/resolution.
+// Best-effort: malformed or fragmented files return ok=false and the task
+// simply omits duration/resolution.
 func probeMP4Metadata(data []byte) (durationMS, width, height int, ok bool) {
 	top := readMP4Boxes(data)
 	moov, found := findMP4Box(top, "moov")

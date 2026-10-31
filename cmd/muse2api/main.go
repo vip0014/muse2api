@@ -5,15 +5,14 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
 	"muse2api/internal/config"
-	"muse2api/internal/muse/browser"
-	"muse2api/internal/muse/protocol"
-	"muse2api/internal/muse/transport"
+	"muse2api/internal/muse/protocol/hatch"
 	"muse2api/internal/server"
 	"muse2api/internal/storage"
 )
@@ -48,17 +47,21 @@ func main() {
 	} else if stored != "" {
 		cfg.APIKey = stored
 	}
-	tr, err := transport.NewHTTP(cfg.SiteURL, cfg.HTTPTimeout, cfg.ProxyURL)
+	site, err := url.Parse(cfg.SiteURL)
 	if err != nil {
-		logger.Error("上游传输初始化失败", "error", err)
+		logger.Error("上游站点地址无效", "error", err)
 		os.Exit(1)
 	}
-	var driver protocol.Driver = protocol.NewHTTPDriver(tr)
-	generationProtocol := "native-http-unavailable"
-	if cfg.BrowserEnabled {
-		driver = browser.NewDriver(cfg, store, tr)
-		generationProtocol = "go-chromium-cdp"
-	}
+	driver := hatch.NewDriver(hatch.DriverConfig{
+		SiteURL:       site,
+		MediaDir:      cfg.MediaDir(),
+		PublicBase:    cfg.PublicBase,
+		ChatTimeout:   cfg.ChatTimeout,
+		ImageTimeout:  cfg.ImageTimeout,
+		VideoTimeout:  cfg.VideoTimeout,
+		MaxMediaBytes: cfg.MaxMediaBytes,
+	}, store)
+	generationProtocol := "hatch-noise-protocol"
 	app := server.New(cfg, store, driver, logger)
 	defer app.Close()
 	httpServer := &http.Server{Addr: cfg.Address(), Handler: app.Handler(), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 60 * time.Second, WriteTimeout: 0, IdleTimeout: 90 * time.Second, MaxHeaderBytes: 1 << 20}
@@ -77,7 +80,7 @@ func main() {
 			}
 		}
 	}()
-	logger.Info("Muse2API 已启动", "address", cfg.Address(), "version", "2.1.0", "generation_protocol", generationProtocol, "browser_enabled", cfg.BrowserEnabled)
+	logger.Info("Muse2API 已启动", "address", cfg.Address(), "version", "2.1.0", "generation_protocol", generationProtocol)
 	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		logger.Error("服务退出", "error", err)
 		os.Exit(1)
