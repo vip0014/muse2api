@@ -38,6 +38,8 @@ type Config struct {
 	AdminUsername            string
 	AdminPassword            string
 	SessionTTL               time.Duration
+	KeepaliveInterval        time.Duration
+	KeepaliveSkipDisabled    bool
 	TrustProxy               bool
 	PublicMedia              bool
 	LogLevel                 string
@@ -132,6 +134,12 @@ func Load(homeOverride string) (Config, error) {
 		return Config{}, err
 	}
 	c.SessionTTL = time.Duration(ttlSeconds) * time.Second
+	keepaliveHours, err := intEnv("MUSE2API_KEEPALIVE_INTERVAL_HOURS", 6, 0, 720)
+	if err != nil {
+		return Config{}, err
+	}
+	c.KeepaliveInterval = time.Duration(keepaliveHours) * time.Hour
+	c.KeepaliveSkipDisabled = boolEnv("MUSE2API_KEEPALIVE_DISABLED_ACCOUNTS")
 	if c.MaxUploadBytes, err = int64Env("MUSE2API_MAX_UPLOAD_BYTES", 40<<20, 1024, 1<<30); err != nil {
 		return Config{}, err
 	}

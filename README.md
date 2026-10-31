@@ -36,7 +36,7 @@
 | 💬 **对话** | `/v1/chat/completions`、`/v1/responses`，普通返回和逐字 SSE 都支持。Responses 支持文本。 |
 | 🎨 **图片** | 文生图、参考图编辑；同步接口和异步任务都能用。支持最多 4 张有序参考图（协议内联上传）。 |
 | 🎬 **视频** | 一次生成一个片段，大约 10 秒、720p；任务里会记录实际时长和分辨率。支持 `images` 多图参考，第一张作为主要起始画面。 |
-| 🔁 **账号池** | 多个账号轮着用，单账号限制并发，任务排队有上限；导入后自动检测会话、刷新额度。 |
+| 🔁 **账号池** | 多个账号轮着用，每个账号独立 VM 连接、独立会话；单账号限制并发，任务排队有上限；导入后自动检测会话、刷新额度，之后定时保活刷新 Cookie。 |
 | 🧷 **幂等** | 图片和视频任务认 `Idempotency-Key`，客户端重试不会重复提交上游。 |
 | 🖥️ **Web 后台** | 账号、任务、媒体、API 调试台、模型能力、设置、日志都有，React + TypeScript 写的。 |
 | 🔐 **登录与凭据** | 管理员用户名/密码进后台，和 API Key 分开。账号 Cookie 用 AES-256-GCM 加密存。 |
@@ -314,6 +314,8 @@ curl http://127.0.0.1:18610/v1/videos \
 | `MUSE2API_MAX_UPLOAD_BYTES` | `41943040` | 请求体上限；24 MiB 原图转 base64 后需要更宽的上限，改大时记得同步改 Nginx 的 `client_max_body_size` |
 | `MUSE2API_REF_IMAGE_LOCAL_FILES` | `0` | 设为 `1` 才允许参考图读取服务器本地文件路径 |
 | `MUSE2API_REF_IMAGE_PRIVATE_FETCH` | `0` | 设为 `1` 才允许参考图下载私网/本机 URL；默认只允许公网并逐跳检查重定向 |
+| `MUSE2API_KEEPALIVE_INTERVAL_HOURS` | `6` | 账号保活间隔（小时）；`0` 关闭。只发 `/api/session`，不唤醒 VM、不生成内容 |
+| `MUSE2API_KEEPALIVE_DISABLED_ACCOUNTS` | `0` | 设为 `1` 时保活跳过已禁用账号 |
 | `MUSE2API_LOG_LEVEL` | `info` | 日志级别 |
 
 其余的超时、并发、队列、目录这些，都在 `.env.example` 里。注意 `.env.example` 里的占位值会被程序拒绝，别直接拿来启动。
@@ -336,6 +338,13 @@ WebSocket:      wss://hatch.metaaivm.com/v1/noise?vm_id=...&auth_token=...&app_i
 已用真实账号验收：文生图、参考图编辑、文生视频、混合并发都能完成，媒体正常落盘；对话按上游 `chat.subscribe` 的增量逐字转发为 SSE；视频结果的时长和分辨率从 MP4 元数据解析。
 
 额度刷新也走纯 HTTP：Muse 的设置页通过 Next.js server action `fetchSubscriptionAction` 返回订阅快照（套餐、每周用量、额外额度），后台只发一次 POST，不唤醒 VM、不启动浏览器。action id 会随部署变化，失效时自动扫描设置页加载的脚本重新定位并缓存。
+
+### 账号连接与保活
+
+- 每个账号一个独立的协议客户端和 WebSocket 连接，账号之间不会串用 VM；同一账号的对话仍按上游要求串行。
+- 连接绑定凭证指纹（`hatch_sess` + 设备标识）：重新导入 Cookie 后旧连接立即作废，下个任务自动重建；`hatch_vml` 在引导过程中轮换不会触发重连。
+- 导入或更新凭据后立即异步检测一次；后台每 6 小时（可配）再跑一轮保活，只调用 `/api/session`，不唤醒 VM、不产生生成费用。检测成功会把上游下发的 `Set-Cookie` 写回加密存储。
+- 已标记过期的账号不会自动重试，需要重新导出 Cookie；删除或禁用账号会释放对应连接。
 
 ### 参考图安全
 

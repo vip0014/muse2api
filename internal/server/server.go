@@ -44,6 +44,7 @@ type Server struct {
 	keyMu        sync.RWMutex
 	apiKey       string
 	autoCheck    *autoChecker
+	keepalive    *keepaliver
 }
 
 func New(cfg config.Config, store *storage.Store, driver protocol.Driver, log *slog.Logger) *Server {
@@ -53,6 +54,9 @@ func New(cfg config.Config, store *storage.Store, driver protocol.Driver, log *s
 	s.autoCheck = newAutoChecker()
 	s.autoCheck.wg.Add(1)
 	go s.autoCheckWorker()
+	s.keepalive = newKeepaliver()
+	s.keepalive.wg.Add(1)
+	go s.keepaliveWorker()
 	return s
 }
 
@@ -76,6 +80,19 @@ func (s *Server) Close() {
 		case <-done:
 		case <-time.After(10 * time.Second):
 			s.log.Warn("后台检测退出超时")
+		}
+	}
+	if s.keepalive != nil {
+		s.keepalive.cancel()
+		done := make(chan struct{})
+		go func() {
+			s.keepalive.wg.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			s.log.Warn("账号保活退出超时")
 		}
 	}
 	driverDone := make(chan struct{})

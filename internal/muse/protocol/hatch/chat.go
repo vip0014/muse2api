@@ -92,6 +92,11 @@ type Client struct {
 	quotaMu       sync.Mutex
 	quotaActionID string
 	quotaActionAt time.Time
+
+	// connKey fingerprints the session credentials the live connection was
+	// built with. A different account (or re-imported cookies) must not reuse
+	// the previous account's VM connection.
+	connKey string
 }
 
 // NewClient builds a protocol client for one muse.ai site.
@@ -103,10 +108,20 @@ func NewClient(site *url.URL, httpClient *http.Client) *Client {
 }
 
 func (c *Client) connect(ctx context.Context, credentials map[string]string) (*Conn, error) {
+	key := credentialFingerprint(credentials)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.conn != nil && !c.conn.IsClosed() {
+	if c.conn != nil && !c.conn.IsClosed() && c.connKey == key {
 		return c.conn, nil
+	}
+	if c.conn != nil {
+		// Different credentials: the old connection belongs to another
+		// account or a session that was replaced. Drop it before dialing.
+		_ = c.conn.Close()
+		c.conn = nil
+		c.session = nil
+		c.registered = false
+		c.connKey = ""
 	}
 	session, err := Bootstrap(ctx, SessionOptions{
 		BaseURL: c.site,
@@ -123,6 +138,7 @@ func (c *Client) connect(ctx context.Context, credentials map[string]string) (*C
 	c.conn = conn
 	c.session = session
 	c.registered = false
+	c.connKey = key
 	return conn, nil
 }
 
@@ -134,6 +150,7 @@ func (c *Client) forgetConnection() {
 	c.conn = nil
 	c.session = nil
 	c.registered = false
+	c.connKey = ""
 	c.mu.Unlock()
 }
 

@@ -180,13 +180,28 @@ func (s *Server) patchAccount(w http.ResponseWriter, r *http.Request) {
 	s.pool.Wake()
 	writeJSON(w, 200, a)
 }
+// accountInvalidator is implemented by drivers that hold per-account
+// connections. Dropping the account forces a fresh bootstrap with the current
+// cookies and stops the old VM connection from being reused.
+type accountInvalidator interface {
+	InvalidateAccount(string)
+}
+
+func (s *Server) invalidateAccount(id string) {
+	if invalidator, ok := s.driver.(accountInvalidator); ok {
+		invalidator.InvalidateAccount(id)
+	}
+}
+
 func (s *Server) deleteAccount(w http.ResponseWriter, r *http.Request) {
-	if err := s.store.DeleteAccount(r.PathValue("id")); err != nil {
+	id := r.PathValue("id")
+	if err := s.store.DeleteAccount(id); err != nil {
 		apierr.Write(w, r, apierr.NotFound("账号不存在"))
 		return
 	}
+	s.invalidateAccount(id)
 	s.pool.Wake()
-	writeJSON(w, 200, map[string]any{"deleted": true, "id": r.PathValue("id")})
+	writeJSON(w, 200, map[string]any{"deleted": true, "id": id})
 }
 func (s *Server) bulkAccounts(w http.ResponseWriter, r *http.Request) {
 	var in struct {
@@ -224,6 +239,9 @@ func (s *Server) bulkAccounts(w http.ResponseWriter, r *http.Request) {
 		}
 		if err == nil {
 			count++
+			if in.Action == "delete" || in.Action == "disable" {
+				s.invalidateAccount(id)
+			}
 		}
 	}
 	s.pool.Wake()
@@ -260,6 +278,7 @@ func (s *Server) updateCookies(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, r, err)
 		return
 	}
+	s.invalidateAccount(a.ID)
 	s.enqueueAutoCheck(a.ID)
 	s.pool.Wake()
 	writeJSON(w, 200, map[string]any{"ok": true, "id": a.ID, "cookie_count": a.CookieCount, "expires_at": a.ExpiresAt, "auto_check": true})

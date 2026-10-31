@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"muse2api/internal/model"
@@ -41,9 +42,15 @@ type DriverConfig struct {
 
 // Driver implements protocol.Driver over the Noise/protobuf gateway.
 type Driver struct {
-	cfg    DriverConfig
-	store  AccountStore
-	client *Client
+	cfg   DriverConfig
+	store AccountStore
+
+	// One Client per account keeps each account's VM connection (and its
+	// serialized conversation) isolated. The scheduler already caps
+	// per-account concurrency, so a shared client would silently run one
+	// account's turn on another account's connection.
+	clientsMu sync.Mutex
+	clients   map[string]*Client
 }
 
 func NewDriver(cfg DriverConfig, store AccountStore) *Driver {
@@ -62,7 +69,31 @@ func NewDriver(cfg DriverConfig, store AccountStore) *Driver {
 	if cfg.MaxMediaBytes <= 0 {
 		cfg.MaxMediaBytes = 512 << 20
 	}
-	return &Driver{cfg: cfg, store: store, client: NewClient(cfg.SiteURL, cfg.HTTPClient)}
+	return &Driver{cfg: cfg, store: store, clients: map[string]*Client{}}
+}
+
+// clientFor returns the per-account protocol client, creating it on first use.
+func (d *Driver) clientFor(accountID string) *Client {
+	d.clientsMu.Lock()
+	defer d.clientsMu.Unlock()
+	if client := d.clients[accountID]; client != nil {
+		return client
+	}
+	client := NewClient(d.cfg.SiteURL, d.cfg.HTTPClient)
+	d.clients[accountID] = client
+	return client
+}
+
+// forgetAccount drops one account's client and its live gateway connection,
+// e.g. after the operator replaces the cookies.
+func (d *Driver) forgetAccount(accountID string) {
+	d.clientsMu.Lock()
+	client := d.clients[accountID]
+	delete(d.clients, accountID)
+	d.clientsMu.Unlock()
+	if client != nil {
+		client.forgetConnection()
+	}
 }
 
 func (d *Driver) Capabilities(context.Context) []capabilities.Capability {
@@ -122,7 +153,7 @@ func (d *Driver) Chat(ctx context.Context, request protocol.ChatRequest) (<-chan
 	out := make(chan protocol.ChatEvent, 32)
 	go func() {
 		defer close(out)
-		stream, streamErr := d.client.ChatStream(ctx, creds.Cookies, request.Prompt, d.cfg.ChatTimeout)
+		stream, streamErr := d.clientFor(request.AccountID).ChatStream(ctx, creds.Cookies, request.Prompt, d.cfg.ChatTimeout)
 		if streamErr != nil {
 			d.persist(creds, streamErr)
 			select {
@@ -178,7 +209,7 @@ func (d *Driver) GenerateImage(ctx context.Context, request protocol.ImageReques
 		return nil, err
 	}
 	prompt := protocol.BuildImagePrompt(request)
-	text, media, err := d.client.ChatWithItems(ctx, creds.Cookies, prompt, items, true, d.cfg.ImageTimeout)
+	text, media, err := d.clientFor(creds.ID).ChatWithItems(ctx, creds.Cookies, prompt, items, true, d.cfg.ImageTimeout)
 	d.persist(creds, err)
 	if err != nil {
 		return nil, err
@@ -208,7 +239,7 @@ func (d *Driver) CreateVideo(ctx context.Context, request protocol.VideoRequest)
 		return nil, err
 	}
 	prompt := protocol.BuildVideoPrompt(request)
-	text, media, err := d.client.ChatWithItems(ctx, creds.Cookies, prompt, items, true, d.cfg.VideoTimeout)
+	text, media, err := d.clientFor(creds.ID).ChatWithItems(ctx, creds.Cookies, prompt, items, true, d.cfg.VideoTimeout)
 	d.persist(creds, err)
 	if err != nil {
 		return nil, err
@@ -229,7 +260,7 @@ func (d *Driver) pickMedia(ctx context.Context, creds protocol.AccountCredential
 		if ref.Kind != expect {
 			continue
 		}
-		data, mimeType, err := d.client.Download(ctx, creds.Cookies, ref)
+		data, mimeType, err := d.clientFor(creds.ID).Download(ctx, creds.Cookies, ref)
 		if err != nil {
 			lastErr = err
 			continue
@@ -276,12 +307,27 @@ func (d *Driver) CheckSession(ctx context.Context, credentials protocol.AccountC
 // QueryQuota reads the subscription/usage snapshot through the settings server
 // action; no VM wake and no browser are involved.
 func (d *Driver) QueryQuota(ctx context.Context, credentials protocol.AccountCredentials) (*model.Quota, error) {
-	return d.client.QueryQuota(ctx, credentials)
+	return d.clientFor(credentials.ID).QueryQuota(ctx, credentials)
 }
 
 func (d *Driver) Close() error {
-	d.client.forgetConnection()
+	d.clientsMu.Lock()
+	clients := make([]*Client, 0, len(d.clients))
+	for _, client := range d.clients {
+		clients = append(clients, client)
+	}
+	d.clients = map[string]*Client{}
+	d.clientsMu.Unlock()
+	for _, client := range clients {
+		client.forgetConnection()
+	}
 	return nil
+}
+
+// InvalidateAccount drops the cached gateway connection for one account. The
+// next task re-bootstraps with the current cookies.
+func (d *Driver) InvalidateAccount(accountID string) {
+	d.forgetAccount(accountID)
 }
 
 // referenceItems converts canonical data URLs into chat.stream items[] image
