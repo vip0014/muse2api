@@ -22,52 +22,96 @@ import (
 )
 
 type attachment struct {
-	TID      string `json:"tid"`
-	HasVideo bool   `json:"hasVideo"`
-	HasImage bool   `json:"hasImg"`
-	Src      string `json:"src"`
-	VSrc     string `json:"vSrc"`
-	ISrc     string `json:"iSrc"`
-	Width    int    `json:"w"`
-	Height   int    `json:"h"`
+	TID          string `json:"tid"`
+	Presentation bool   `json:"presentation"`
+	HasVideo     bool   `json:"hasVideo"`
+	HasImage     bool   `json:"hasImg"`
+	Src          string `json:"src"`
+	VSrc         string `json:"vSrc"`
+	ISrc         string `json:"iSrc"`
+	Width        int    `json:"w"`
+	Height       int    `json:"h"`
 }
 
+// attachmentsJS collects generated media. The official UI renders results in
+// hatch-chat-attachment-presentation-* containers; the animated agent avatar
+// (hatch_working / hatch_making_something / ...) is also a <video> element and
+// used to be picked up as a generation result. Presentation containers are
+// therefore treated as the only trusted source; bubble media is a fallback for
+// text-delivered results and explicitly excludes avatar/UI animation videos.
 const attachmentsJS = `(function(){
-	var list=[], seen=new Set();
-	function add(src,tid,el){
-		if(!src||seen.has(src))return;
-		seen.add(src);
-		var v=el&&(el.tagName==='VIDEO'?el:(el.querySelector?el.querySelector('video'):null));
-		var img=el&&(el.tagName==='IMG'?el:(el.querySelector?el.querySelector('img'):null));
-		var primary=v||img;
-		var w=primary?(primary.videoWidth||primary.naturalWidth||primary.width||0):0;
-		var h=primary?(primary.videoHeight||primary.naturalHeight||primary.height||0):0;
-		if(w&&h&&w<100&&h<100)return;
-		list.push({tid:tid||'',hasVideo:!!v,hasImg:!!img,src:src,vSrc:v?(v.currentSrc||v.src||''):'',iSrc:img?(img.currentSrc||img.src||''):'',w:w,h:h});
+	var UI=/(?:avatar|emoji|icon|logo|favicon|sprite|\/videos\/avatars\/|hatch[_-](?:working|connecting|making[_-]?something|milestone|idle))/i;
+	var list=[], seenSrc=new Set(), seenEl=new Set();
+	function skip(el){try{return !!(el.closest&&el.closest('form, [class*=chat-user-bubble], [class*="group/msg"]'));}catch(e){return false;}}
+	function uiAncestor(el){try{return !!(el.closest&&el.closest('[class*="avatar"],[data-testid*="avatar"],[class*="emoji"],[data-testid*="emoji"],[class*="sprite"],[class*="logo"],[class*="icon"]'));}catch(e){return false;}}
+	function hidden(el){return !!(el.getAttribute&&el.getAttribute('aria-hidden')==='true');}
+	function mediaSrc(m){
+		if(!m)return '';
+		if(m.tagName==='VIDEO'){
+			var s=m.currentSrc||m.src||'';
+			if(!s&&m.querySelector){var so=m.querySelector('source[src]');if(so)s=so.src||so.getAttribute('src')||'';}
+			return s;
+		}
+		return m.currentSrc||m.src||'';
 	}
-	var scope=document;
-	function skip(el){return el.closest('form, [class*=chat-user-bubble]');}
-	scope.querySelectorAll('[data-testid*="attachment"],[data-testid*="presentation"],[class*="attachment"]').forEach(function(a){
-		if(skip(a))return;
-		var v=a.querySelector('video'), img=a.querySelector('img');
-		if(v)add(v.currentSrc||v.src,a.getAttribute('data-testid')||'video',a);
-		else if(img)add(img.currentSrc||img.src,a.getAttribute('data-testid')||'image',a);
-	});
-	scope.querySelectorAll('img,video').forEach(function(m){
-		if(skip(m))return;
-		var src=m.currentSrc||m.src||'';
-		if(!src||/avatar|emoji|icon|logo|favicon|sprite/i.test(src))return;
-		var w=m.videoWidth||m.naturalWidth||m.width||0;
-		var h=m.videoHeight||m.naturalHeight||m.height||0;
+	function box(m){return m?[m.videoWidth||m.naturalWidth||m.width||0,m.videoHeight||m.naturalHeight||m.height||0]:[0,0];}
+	function displayed(m){try{var r=m.getBoundingClientRect();return [r.width||0,r.height||0];}catch(e){return [0,0];}}
+	function addMedia(el,tid,presentation){
+		if(!el||seenEl.has(el)||skip(el))return;
+		seenEl.add(el);
+		var v=el.tagName==='VIDEO'?el:(el.querySelector?el.querySelector('video'):null);
+		var img=el.tagName==='IMG'?el:(el.querySelector?el.querySelector('img'):null);
+		var primary=v||img;if(!primary)return;
+		var src=mediaSrc(primary);
+		if(!src||UI.test(src)||hidden(primary)||uiAncestor(primary))return;
+		var wh=box(primary),w=wh[0],h=wh[1];
 		if(w&&h&&w<100&&h<100)return;
-		add(src,m.tagName==='VIDEO'?'video':'image',m);
-	});
-	scope.querySelectorAll('div[class*="hatch-agent-bubble-bg"] div, div[class*="hatch-agent-bubble-bg"] a').forEach(function(el){
-		if(skip(el))return;
-		var bg=getComputedStyle(el).backgroundImage||'';
+		// Bubble fallback must not pick up the small animated agent avatar; a real
+		// result is displayed as a large media card. Presentation containers are
+		// exempt because they can be collapsed/offscreen while loading.
+		if(!presentation){var d=displayed(primary);if(d[0]>0&&d[1]>0&&(d[0]<160||d[1]<160))return;}
+		if(seenSrc.has(src))return;
+		seenSrc.add(src);
+		list.push({tid:tid||'',presentation:!!presentation,hasVideo:!!v,hasImg:!!img,src:src,vSrc:v?mediaSrc(v):'',iSrc:img?mediaSrc(img):'',w:w,h:h});
+	}
+	function addBg(el,tid){
+		if(!el||seenEl.has(el)||skip(el))return;
+		seenEl.add(el);
+		var bg='';try{bg=getComputedStyle(el).backgroundImage||'';}catch(e){}
 		var m=bg.match(/url\(["']?(.*?)["']?\)/);
-		if(m&&m[1]&&!/avatar|emoji|icon|logo|favicon|sprite/i.test(m[1]))add(m[1],'background',el);
+		if(!m||!m[1])return;
+		var src=m[1];
+		if(UI.test(src)||uiAncestor(el))return;
+		if(seenSrc.has(src))return;
+		seenSrc.add(src);
+		list.push({tid:tid||'background',presentation:false,hasVideo:false,hasImg:true,src:src,vSrc:'',iSrc:src,w:0,h:0});
+	}
+	function frameDocs(root,out){
+		out=out||[];
+		try{root.querySelectorAll('iframe').forEach(function(f){
+			try{var d=f.contentDocument;if(d){out.push(d);frameDocs(d,out);}}catch(e){}
+		});}catch(e){}
+		return out;
+	}
+	// Trusted result containers first: dedupe by source keeps the presentation
+	// flag even when the same media also appears in the bubble. Generated
+	// artifacts may render their media inside a same-origin iframe.
+	document.querySelectorAll('[data-testid^="hatch-chat-attachment-presentation-"]').forEach(function(a){
+		var tid=a.getAttribute('data-testid')||'presentation';
+		addMedia(a,tid,true);
+		frameDocs(a).forEach(function(doc){
+			try{doc.querySelectorAll('video, img').forEach(function(m){addMedia(m,tid,true);});}catch(e){}
+		});
 	});
+	// Fallback: only the newest agent bubble, so older conversation media and
+	// sidebar/avatar animations cannot masquerade as the new result.
+	var bubbles=[].slice.call(document.querySelectorAll('div[class*="hatch-agent-bubble-bg"]'));
+	var scope=bubbles.length?bubbles[bubbles.length-1]:null;
+	if(scope){
+		scope.querySelectorAll('video').forEach(function(v){addMedia(v,'agent-video',false);});
+		scope.querySelectorAll('img').forEach(function(m){addMedia(m,'agent-image',false);});
+		scope.querySelectorAll('div, a').forEach(function(el){addBg(el,'background');});
+	}
 	return JSON.stringify(list);
 })()`
 
@@ -176,19 +220,145 @@ func (p *Page) attachImage(ctx context.Context, raw string) error {
 	return p.attachImages(ctx, []string{raw})
 }
 
-func mediaSource(a attachment, expect string) string {
-	if expect == "video" && a.VSrc != "" {
+// uiMediaPattern matches the official agent's animated avatar/UI assets. Those
+// are <video> elements too, so they must never be reported as generated media.
+var uiMediaPattern = regexp.MustCompile(`(?i)(?:avatar|emoji|icon|logo|favicon|sprite|/videos/avatars/|hatch[_-](?:working|connecting|making[_-]?something|milestone|idle))`)
+
+func isUIMediaSource(source string) bool {
+	return source != "" && uiMediaPattern.MatchString(source)
+}
+
+// mediaExtension returns a lowercase file extension for direct media URLs,
+// ignoring query strings and fragments. Blob and signed URLs without a suffix
+// return "".
+func mediaExtension(source string) string {
+	lower := strings.ToLower(strings.TrimSpace(source))
+	if i := strings.IndexAny(lower, "?#"); i >= 0 {
+		lower = lower[:i]
+	}
+	for _, ext := range []string{".mp4", ".webm", ".mov", ".m4v", ".png", ".jpg", ".jpeg", ".webp", ".gif"} {
+		if strings.HasSuffix(lower, ext) {
+			return ext
+		}
+	}
+	return ""
+}
+
+func videoSource(a attachment) string {
+	if a.VSrc != "" && !isUIMediaSource(a.VSrc) {
 		return a.VSrc
 	}
-	return a.Src
+	if !isUIMediaSource(a.Src) {
+		switch mediaExtension(a.Src) {
+		case ".mp4", ".webm", ".mov", ".m4v":
+			return a.Src
+		}
+	}
+	return ""
+}
+
+func mediaSource(a attachment, expect string) string {
+	if expect == "video" {
+		return videoSource(a)
+	}
+	if a.Src != "" {
+		return a.Src
+	}
+	return a.ISrc
 }
 
 func matchingAttachment(a attachment, expect string) bool {
-	src := strings.ToLower(a.Src)
-	if expect == "video" {
-		return a.HasVideo || a.VSrc != "" || strings.HasSuffix(src, ".mp4") || strings.HasSuffix(src, ".webm") || strings.HasSuffix(src, ".mov")
+	if isUIMediaSource(a.Src) || isUIMediaSource(a.VSrc) {
+		return false
 	}
-	return strings.Contains(strings.ToLower(a.TID), "image") || (!a.HasVideo && !strings.HasSuffix(src, ".mp4") && !strings.HasSuffix(src, ".webm") && !strings.HasSuffix(src, ".mov"))
+	if expect == "video" {
+		return a.HasVideo || videoSource(a) != ""
+	}
+	if a.HasVideo || videoSource(a) != "" {
+		return false
+	}
+	return a.HasImage || a.Src != "" || strings.Contains(strings.ToLower(a.TID), "image")
+}
+
+// selectVideoAttachments returns video results newest-last. Once the page has
+// any attachment presentation container, only media from those containers is
+// trusted: the agent avatar is a plain <video> in the bubble and must never
+// win over a real (possibly still loading) presentation result. Direct video
+// URLs in a bubble remain a fallback for text-delivered results only when the
+// page has no presentation container at all.
+func selectVideoAttachments(attachments []attachment) []attachment {
+	hasPresentation := false
+	for _, item := range attachments {
+		if item.Presentation && (item.HasVideo || item.HasImage || item.Src != "") {
+			hasPresentation = true
+			break
+		}
+	}
+	out := make([]attachment, 0, len(attachments))
+	for _, item := range attachments {
+		if !matchingAttachment(item, "video") {
+			continue
+		}
+		if item.Presentation {
+			out = append(out, item)
+			continue
+		}
+		if !hasPresentation && mediaExtension(mediaSource(item, "video")) != "" {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+const mediaDiagnosticsJS = `(function(){
+	var UI=/(?:avatar|emoji|icon|logo|favicon|sprite|\/videos\/avatars\/|hatch[_-](?:working|connecting|making[_-]?something|milestone|idle))/i;
+	function ui(el,src){if(UI.test(src||''))return true;try{return !!(el.closest&&el.closest('[class*="avatar"],[data-testid*="avatar"],[class*="emoji"]'));}catch(e){return false;}}
+	function docs(root,out){
+		out=out||[root];
+		try{root.querySelectorAll('iframe').forEach(function(f){
+			try{var d=f.contentDocument;if(d){out.push(d);docs(d,out);}}catch(e){}
+		});}catch(e){}
+		return out;
+	}
+	var out={uiVideos:0,videos:0,presentations:0,presentationVideos:0,presentationImages:0};
+	docs(document).forEach(function(doc){
+		doc.querySelectorAll('video').forEach(function(v){
+			var src=v.currentSrc||v.src||'';
+			if(!src&&v.querySelector){var so=v.querySelector('source[src]');if(so)src=so.src||so.getAttribute('src')||'';}
+			if(ui(v,src))out.uiVideos++;else out.videos++;
+		});
+		doc.querySelectorAll('[data-testid^="hatch-chat-attachment-presentation-"]').forEach(function(a){
+			out.presentations++;
+			if(a.querySelector('video'))out.presentationVideos++;
+			if(a.querySelector('img'))out.presentationImages++;
+		});
+	});
+	return JSON.stringify(out);
+})()`
+
+func diagnosticSuffix(diag string) string {
+	if diag == "" {
+		return ""
+	}
+	return "；" + diag
+}
+
+func (p *Page) mediaDiagnostics(ctx context.Context) string {
+	var raw string
+	if err := p.conn.JS(ctx, mediaDiagnosticsJS, false, &raw); err != nil {
+		return ""
+	}
+	var d struct {
+		UIVideos           int `json:"uiVideos"`
+		Videos             int `json:"videos"`
+		Presentations      int `json:"presentations"`
+		PresentationVideos int `json:"presentationVideos"`
+		PresentationImages int `json:"presentationImages"`
+	}
+	if err := json.Unmarshal([]byte(raw), &d); err != nil {
+		return ""
+	}
+	return fmt.Sprintf("页面诊断：附件容器 %d，视频节点 %d（其中头像动画 %d），容器内视频 %d、图片 %d", d.Presentations, d.Videos+d.UIVideos, d.UIVideos, d.PresentationVideos, d.PresentationImages)
 }
 
 var mediaReportPattern = regexp.MustCompile(`(?i)\.(webp|png|jpe?g|mp4|webm)|imagine_media|deliverable|generated\s+.*image|verified\s+generated|artifact`)
@@ -255,7 +425,10 @@ func (p *Page) waitAttachment(ctx context.Context, baseline map[string]bool, bas
 	for {
 		if err := ctx.Err(); err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
-				return nil, fmt.Errorf("等待生成超时（stop=%v, bubbles=%d, attachments=%d, text=%q）: %w", lastStop, lastCount, lastAttachments, cleanModelText(lastStateText, 80), err)
+				diagCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				diag := p.mediaDiagnostics(diagCtx)
+				cancel()
+				return nil, fmt.Errorf("等待生成超时（stop=%v, bubbles=%d, attachments=%d, text=%q%s）: %w", lastStop, lastCount, lastAttachments, cleanModelText(lastStateText, 80), diagnosticSuffix(diag), err)
 			}
 			return nil, err
 		}
@@ -274,17 +447,14 @@ func (p *Page) waitAttachment(ctx context.Context, baseline map[string]bool, bas
 				matching = append(matching, item)
 			}
 		}
+		if expect == "video" {
+			matching = selectVideoAttachments(attachments)
+		}
 		var candidate *attachment
 		source := ""
 		if len(matching) > 0 {
 			item := matching[len(matching)-1]
 			source = mediaSource(item, expect)
-			if expect == "video" && item.VSrc == "" {
-				lower := strings.ToLower(source)
-				if !strings.HasSuffix(lower, ".mp4") && !strings.HasSuffix(lower, ".webm") && !strings.HasSuffix(lower, ".mov") {
-					source = ""
-				}
-			}
 			if source != "" && !baseline[source] {
 				candidate = &item
 			}
@@ -306,13 +476,19 @@ func (p *Page) waitAttachment(ctx context.Context, baseline map[string]bool, bas
 		// early partial/placeholder image would otherwise be fetched while the
 		// real file is still being written, which hangs extraction and burns the
 		// whole task timeout.
+		requiredStable := 1
+		if candidate != nil && expect == "video" && !candidate.Presentation {
+			// A bubble-delivered direct video URL is weaker evidence than an
+			// attachment presentation; make it survive three polls.
+			requiredStable = 3
+		}
 		if candidate != nil && !state.Stop {
 			if source == stableSrc {
 				stableCount++
 			} else {
 				stableSrc, stableCount = source, 0
 			}
-			if stableCount >= 1 {
+			if stableCount >= requiredStable {
 				return candidate, nil
 			}
 		} else if candidate != nil && state.Stop {
@@ -368,7 +544,20 @@ func (p *Page) waitAttachment(ctx context.Context, baseline map[string]bool, bas
 			if text := cleanModelText(state.Text, 200); text != "" {
 				message += "：" + text
 			}
-			return nil, errors.New(message)
+			diagCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			diag := p.mediaDiagnostics(diagCtx)
+			cancel()
+			return nil, errors.New(message + diagnosticSuffix(diag))
+		}
+		if expect == "video" && !state.Stop && candidate == nil && time.Since(lastActivity) > 120*time.Second {
+			message := "生成已结束但未检测到视频附件"
+			if text := cleanModelText(state.Text, 200); text != "" {
+				message += "：" + text
+			}
+			diagCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			diag := p.mediaDiagnostics(diagCtx)
+			cancel()
+			return nil, errors.New(message + "（官方页面可能只返回了分享页/静帧）" + diagnosticSuffix(diag))
 		}
 		if expect == "video" && seenStop && !state.Stop &&
 			strings.HasSuffix(strings.TrimRight(state.Path, "/"), "/thread/new") &&
@@ -474,6 +663,9 @@ func pickExtension(mimeType, source, expect string) string {
 func (e *Engine) saveMedia(data []byte, _ string, source, expect string) (*protocol.ImageResult, error) {
 	if len(data) == 0 || int64(len(data)) > e.cfg.MaxMediaBytes {
 		return nil, errors.New("媒体内容为空或超过大小限制")
+	}
+	if isUIMediaSource(source) {
+		return nil, errors.New("提取结果是官方界面动画资源，已拒绝作为生成结果")
 	}
 	kind, _, ext := detectMediaType(data)
 	if kind == "" {
