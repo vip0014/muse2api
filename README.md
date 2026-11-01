@@ -27,8 +27,6 @@
 
 一句话：它不是 Muse 官方 API，而是一个自己托管的小网关。后端用 Go，后台用 React。生成走**纯协议**：直接和 Muse 的 Noise 加密 WebSocket + protobuf 网关对话，不需要浏览器、也不依赖页面结构。对外给你一套 `/v1` 接口，现成的 OpenAI 客户端、脚本或者自己的小工具改个 Base URL 就能接。
 
-项目基于 [czg86389-hub/muse2api](https://github.com/czg86389-hub/muse2api) 的 Python 版本，用 Go + React 重写；`18610` 端口、Bearer Key、`/v1` 路径和 `./data` 数据目录这些使用习惯保持不变。
-
 ## 🧩 它现在能做什么
 
 | 能力 | 现在的情况 |
