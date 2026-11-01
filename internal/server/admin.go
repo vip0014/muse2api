@@ -13,7 +13,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"muse2api/internal/apierr"
@@ -315,11 +314,13 @@ type sessionCheckResult struct {
 func (s *Server) checkAndStoreSession(ctx context.Context, account model.Account) sessionCheckResult {
 	// Auto-check, keepalive and manual test can target the same account.
 	// Single-flight it so two stale snapshots cannot race and write back
-	// different cookie rotations.
-	value, _ := s.checkLocks.LoadOrStore(account.ID, &sync.Mutex{})
-	lock := value.(*sync.Mutex)
-	lock.Lock()
-	defer lock.Unlock()
+	// different cookie rotations. Waiting is cancellable: a manual test must
+	// fail fast instead of hanging behind a background check.
+	release, err := s.checkLocks.acquire(ctx, account.ID)
+	if err != nil {
+		return sessionCheckResult{Message: "检测等待超时，请稍后重试"}
+	}
+	defer release()
 	session, checkErr := s.driver.CheckSession(ctx, protocol.AccountCredentials{ID: account.ID, Cookies: account.Cookies, CookieExpiry: account.CookieExpiry})
 	ok := checkErr == nil && session != nil && session.Valid
 	if _, err := s.store.UpdateAccount(account.ID, func(a *model.Account) error {

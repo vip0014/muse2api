@@ -98,8 +98,9 @@ type Client struct {
 
 	// quotaActionID caches the Next.js server-action id that returns the
 	// subscription snapshot. The id is build-specific, so it is re-discovered
-	// whenever the upstream deployment changes.
-	quotaFlight   sync.Mutex
+	// whenever the upstream deployment changes. quotaGate serializes refreshes
+	// per account but remains cancellable when the caller gives up.
+	quotaGate     chan struct{}
 	quotaMu       sync.Mutex
 	quotaActionID string
 	quotaActionAt time.Time
@@ -122,7 +123,7 @@ func NewClientWithWSURL(site *url.URL, httpClient *http.Client, wsURL string) *C
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 25 * time.Second}
 	}
-	return &Client{site: site, wsURL: wsURL, httpClient: httpClient, nodeID: randomRequestID()}
+	return &Client{site: site, wsURL: wsURL, httpClient: httpClient, nodeID: randomRequestID(), quotaGate: make(chan struct{}, 1)}
 }
 
 // SetWSDialer configures the WebSocket proxy/TLS dialer for this client.

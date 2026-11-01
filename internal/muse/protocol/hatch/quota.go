@@ -44,18 +44,24 @@ var (
 // the same HTTP session (cookies) as the gateway bootstrap, but never wakes or
 // contacts the VM.
 func (c *Client) QueryQuota(ctx context.Context, creds protocol.AccountCredentials) (*model.Quota, error) {
-	// A cold action-id cache can trigger a multi-chunk scan. Serialize it per
-	// account instead of launching the same scan from auto-check and admin.
-	c.quotaFlight.Lock()
-	defer c.quotaFlight.Unlock()
 	if c.site == nil {
 		return nil, errors.New("额度查询缺少上游地址")
 	}
 	if len(creds.Cookies) == 0 {
 		return nil, protocol.ErrSessionExpired
 	}
+	// The deadline covers queueing as well as the request itself, so an admin
+	// refresh cannot wait out a slow background scan before its own work starts.
 	ctx, cancel := context.WithTimeout(ctx, 50*time.Second)
 	defer cancel()
+	// A cold action-id cache can trigger a multi-chunk scan. Serialize it per
+	// account instead of launching the same scan from auto-check and admin.
+	select {
+	case c.quotaGate <- struct{}{}:
+		defer func() { <-c.quotaGate }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 
 	actionID := c.cachedQuotaAction()
 	subscription, err := c.callQuotaAction(ctx, creds.Cookies, actionID)

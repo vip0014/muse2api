@@ -47,11 +47,11 @@ type Server struct {
 	apiKey       string
 	autoCheck    *autoChecker
 	keepalive    *keepaliver
-	checkLocks   sync.Map
+	checkLocks   *keyedGate
 }
 
 func New(cfg config.Config, store *storage.Store, driver protocol.Driver, log *slog.Logger) *Server {
-	s := &Server{cfg: cfg, store: store, driver: driver, log: log, authLimiter: auth.NewLimiter(), loginLimiter: auth.NewLimiter(), sessions: auth.NewSessionManager(cfg.SessionTTL), adminUser: cfg.AdminUsername, adminPass: cfg.AdminPassword, apiKey: cfg.APIKey}
+	s := &Server{cfg: cfg, store: store, driver: driver, log: log, authLimiter: auth.NewLimiter(), loginLimiter: auth.NewLimiter(), sessions: auth.NewSessionManager(cfg.SessionTTL), adminUser: cfg.AdminUsername, adminPass: cfg.AdminPassword, apiKey: cfg.APIKey, checkLocks: newKeyedGate()}
 	limits := map[scheduler.Class]int{}
 	if cfg.ChatConcurrency > 0 {
 		limits[scheduler.ClassChat] = cfg.ChatConcurrency

@@ -36,18 +36,37 @@ export default function Accounts({ initialSearch = '', initialStatus = '', initi
   const [remove, setRemove] = useState<Account>()
   const [message, setMessage] = useState('')
   const [errorMessage, setErrorMessage] = useState('')
-  const [autoChecking, setAutoChecking] = useState(false)
+  // Track the accounts this page actually queued for background checking.
+  // Requiring every account in the pool to settle left the poll running until
+  // the 3-minute timeout whenever an unrelated account was never checked.
+  const [autoCheckIds, setAutoCheckIds] = useState<Set<string>>(() => new Set())
+  const autoChecking = autoCheckIds.size > 0
   const isMobile = useMediaQuery('(max-width: 960px)')
   const client = useQueryClient()
 
   const { data, isLoading, isFetching, error, refetch } = useQuery({ queryKey: ['accounts'], queryFn: ({ signal }) => api<{ accounts: Account[] }>('/admin/accounts', { signal }), refetchInterval: autoChecking ? 3000 : false })
   useEffect(() => {
     if (!autoChecking) return
-    const timer = window.setTimeout(() => setAutoChecking(false), 180_000)
+    const timer = window.setTimeout(() => setAutoCheckIds(new Set()), 180_000)
     return () => window.clearTimeout(timer)
   }, [autoChecking])
   useEffect(() => {
-    if (autoChecking && data?.accounts.length && data.accounts.every(account => account.checked_at && (account.quota?.checked_at || account.last_error))) setAutoChecking(false)
+    if (!autoChecking || !data) return
+    const byId = new Map(data.accounts.map(account => [account.id, account]))
+    setAutoCheckIds(current => {
+      let changed = false
+      const next = new Set<string>()
+      for (const id of current) {
+        const account = byId.get(id)
+        // A missing account may simply be a stale snapshot fetched before the
+        // import landed; keep watching it until the timeout instead of ending
+        // the poll on a race.
+        const settled = Boolean(account && account.checked_at && (account.quota?.checked_at || account.last_error))
+        if (settled) changed = true
+        else next.add(id)
+      }
+      return changed ? next : current
+    })
   }, [autoChecking, data])
   useEffect(() => { if (initialFocus) setSelectedId(initialFocus) }, [initialFocus])
   useEffect(() => {
@@ -160,8 +179,20 @@ export default function Accounts({ initialSearch = '', initialStatus = '', initi
       </>}
     </section>
 
-    <AccountDialog open={addOpen} onOpenChange={setAddOpen} onSubmit={async value => { await action.mutateAsync({ path: '/admin/accounts', body: value }); setAddOpen(false); setMessage('账号已导入，后台正在检测并刷新额度'); setAutoChecking(true) }} />
-    <AccountDialog open={Boolean(reauth)} onOpenChange={() => setReauth(undefined)} account={reauth} onSubmit={async value => { if (!reauth) return; await action.mutateAsync({ path: `/admin/accounts/${reauth.id}/cookies`, body: value }); setReauth(undefined); setMessage('凭据已更新，后台正在检测并刷新额度'); setAutoChecking(true) }} />
+    <AccountDialog open={addOpen} onOpenChange={setAddOpen} onSubmit={async value => {
+      const result = await action.mutateAsync({ path: '/admin/accounts', body: value }) as { added?: Account[] }
+      setAddOpen(false)
+      setMessage('账号已导入，后台正在检测并刷新额度')
+      const ids = (result?.added ?? []).map(account => account.id)
+      if (ids.length > 0) setAutoCheckIds(new Set(ids))
+    }} />
+    <AccountDialog open={Boolean(reauth)} onOpenChange={() => setReauth(undefined)} account={reauth} onSubmit={async value => {
+      if (!reauth) return
+      await action.mutateAsync({ path: `/admin/accounts/${reauth.id}/cookies`, body: value })
+      setReauth(undefined)
+      setMessage('凭据已更新，后台正在检测并刷新额度')
+      setAutoCheckIds(new Set([reauth.id]))
+    }} />
     <Modal open={Boolean(edit)} onOpenChange={() => setEdit(undefined)} title="编辑账号" description={edit?.id}>{edit && <form className="form-stack" onSubmit={event => { event.preventDefault(); const form = new FormData(event.currentTarget); action.mutate({ path: `/admin/accounts/${edit.id}`, method: 'PATCH', body: { label: form.get('label'), max_concurrency: Number(form.get('max_concurrency')) } }, { onSuccess: () => setEdit(undefined) }) }}><Field label="账号标签"><Input name="label" required maxLength={80} defaultValue={edit.label} /></Field><Field label="并发上限"><Input name="max_concurrency" type="number" min={1} max={32} defaultValue={edit.max_concurrency} /></Field><div className="dialog-actions"><Button type="button" variant="secondary" onClick={() => setEdit(undefined)}>取消</Button><Button disabled={action.isPending}>保存</Button></div></form>}</Modal>
     <Confirm open={Boolean(remove)} onOpenChange={() => setRemove(undefined)} title={`删除账号「${remove?.label}」？`} description="永久删除账号及加密凭据，任务与媒体保留。" busy={action.isPending} onConfirm={() => remove && deleteAccount(remove)} />
   </div>
