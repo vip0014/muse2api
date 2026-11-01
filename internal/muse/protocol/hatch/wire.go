@@ -21,6 +21,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"time"
 )
 
 const (
@@ -28,6 +29,9 @@ const (
 	maxChunkPayload = 4 << 20
 	maxChunks       = 256
 	maxAssembly     = 16 << 20
+	// Keep the total memory a peer can pin with incomplete assemblies bounded.
+	maxPendingAssemblies = 32
+	maxPendingBytes      = 64 << 20
 )
 
 // ---------------------------------------------------------------------------
@@ -406,22 +410,46 @@ func splitNoisePayload(data []byte) ([][]byte, error) {
 }
 
 type reassembler struct {
-	pending map[int64]*assembly
-	order   []int64
+	pending    map[int64]*assembly
+	totalBytes int
 }
 
 type assembly struct {
-	total int
-	parts map[int][]byte
-	size  int
+	total   int
+	parts   map[int][]byte
+	size    int
+	updated time.Time
 }
 
 func newReassembler() *reassembler {
 	return &reassembler{pending: map[int64]*assembly{}}
 }
 
+func (r *reassembler) drop(id int64) {
+	if old := r.pending[id]; old != nil {
+		r.totalBytes -= old.size
+		delete(r.pending, id)
+	}
+}
+
+func (r *reassembler) evictOldest() {
+	var oldestID int64
+	var oldest time.Time
+	found := false
+	for id, asm := range r.pending {
+		if !found || asm.updated.Before(oldest) {
+			oldestID, oldest, found = id, asm.updated, true
+		}
+	}
+	if found {
+		r.drop(oldestID)
+	}
+}
+
 // feed returns (payload, complete, error). Incomplete multi-chunk payloads
-// return complete=false.
+// return complete=false. Completed assemblies are removed immediately; the
+// old implementation leaked one order entry per inbound frame and its
+// eviction therefore stopped working on long-lived connections.
 func (r *reassembler) feed(raw []byte) ([]byte, bool, error) {
 	chunk, err := decodeNoiseChunk(raw)
 	if err != nil {
@@ -434,38 +462,40 @@ func (r *reassembler) feed(raw []byte) ([]byte, bool, error) {
 		return nil, false, errors.New("invalid chunk_index")
 	}
 	if len(chunk.Payload) > maxChunkPayload {
-		delete(r.pending, chunk.ID)
+		r.drop(chunk.ID)
 		return nil, false, errors.New("noise frame payload too large")
 	}
 	asm := r.pending[chunk.ID]
 	if asm == nil {
-		if len(r.pending) >= 32 {
-			oldest := r.order[0]
-			r.order = r.order[1:]
-			delete(r.pending, oldest)
+		for len(r.pending) >= maxPendingAssemblies || (r.totalBytes+len(chunk.Payload) > maxPendingBytes && len(r.pending) > 0) {
+			r.evictOldest()
 		}
-		asm = &assembly{total: chunk.Total, parts: map[int][]byte{}}
+		if r.totalBytes+len(chunk.Payload) > maxPendingBytes {
+			return nil, false, errors.New("pending noise assemblies exceeded memory budget")
+		}
+		asm = &assembly{total: chunk.Total, parts: map[int][]byte{}, updated: time.Now()}
 		r.pending[chunk.ID] = asm
-		r.order = append(r.order, chunk.ID)
 	}
 	if asm.total != chunk.Total {
-		delete(r.pending, chunk.ID)
+		r.drop(chunk.ID)
 		return nil, false, errors.New("inconsistent total_chunks")
 	}
 	if _, exists := asm.parts[chunk.Index]; exists {
-		delete(r.pending, chunk.ID)
+		r.drop(chunk.ID)
 		return nil, false, errors.New("duplicate noise chunk")
 	}
 	asm.parts[chunk.Index] = chunk.Payload
 	asm.size += len(chunk.Payload)
+	asm.updated = time.Now()
+	r.totalBytes += len(chunk.Payload)
 	if asm.size > maxAssembly {
-		delete(r.pending, chunk.ID)
+		r.drop(chunk.ID)
 		return nil, false, errors.New("noise assembly exceeded 16 MiB")
 	}
 	if len(asm.parts) != asm.total {
 		return nil, false, nil
 	}
-	delete(r.pending, chunk.ID)
+	r.drop(chunk.ID)
 	out := make([]byte, 0, asm.size)
 	for i := 0; i < asm.total; i++ {
 		out = append(out, asm.parts[i]...)

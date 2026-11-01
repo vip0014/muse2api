@@ -439,7 +439,7 @@ func TestRevealAPIKeyRequiresPassword(t *testing.T) {
 		t.Fatalf("masked key leaked: %d %s", rec.Code, rec.Body.String())
 	}
 	rec = adminRequest(h, "POST", "/admin/apikey/reveal", `{"password":"wrong"}`, cookie)
-	if rec.Code != http.StatusUnauthorized || strings.Contains(rec.Body.String(), "test-secret") {
+	if rec.Code != http.StatusForbidden || strings.Contains(rec.Body.String(), "test-secret") {
 		t.Fatalf("wrong password: %d %s", rec.Code, rec.Body.String())
 	}
 	rec = adminRequest(h, "POST", "/admin/apikey/reveal", `{"password":"test-admin-pass"}`, cookie)

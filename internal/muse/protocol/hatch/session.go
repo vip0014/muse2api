@@ -14,6 +14,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"muse2api/internal/muse/protocol"
 )
 
 // Gateway constants come from the web bundle (protocol.json).
@@ -25,21 +27,27 @@ const (
 
 // Session is a bootstrapped gateway admission (VM + auth token).
 type Session struct {
-	VMID      string
-	Endpoint  string
-	AuthToken string
-	Notary    string
-	WSURL     string
+	VMID         string
+	Endpoint     string
+	AuthToken    string
+	Notary       string
+	WSURL        string
+	Cookies      map[string]string
+	CookieExpiry map[string]int64
 }
 
 // SessionOptions carries the HTTP bootstrap inputs.
 type SessionOptions struct {
-	BaseURL *url.URL // e.g. https://muse.ai
-	Client  *http.Client
-	Cookies map[string]string
-	LBHost  string
-	WSPath  string
-	AppID   string
+	BaseURL      *url.URL // e.g. https://muse.ai
+	Client       *http.Client
+	Cookies      map[string]string
+	CookieExpiry map[string]int64
+	LBHost       string
+	WSPath       string
+	AppID        string
+	// WSURL overrides the constructed wss:// URL. It is used by integration
+	// tests and staging environments; empty keeps production behavior.
+	WSURL string
 }
 
 // Bootstrap resolves the account VM, wakes it when needed, obtains the hatch
@@ -53,6 +61,9 @@ func Bootstrap(ctx context.Context, opts SessionOptions) (*Session, error) {
 	}
 	if opts.Cookies == nil {
 		opts.Cookies = map[string]string{}
+	}
+	if opts.CookieExpiry == nil {
+		opts.CookieExpiry = map[string]int64{}
 	}
 	lbHost := opts.LBHost
 	if lbHost == "" {
@@ -152,8 +163,11 @@ func Bootstrap(ctx context.Context, opts SessionOptions) (*Session, error) {
 	if notary != "" {
 		params.Set("notary_token", notary)
 	}
-	wsURL := "wss://" + lbHost + wsPath + "?" + params.Encode()
-	return &Session{VMID: vmID, Endpoint: endpoint, AuthToken: authToken, Notary: notary, WSURL: wsURL}, nil
+	wsURL := opts.WSURL
+	if wsURL == "" {
+		wsURL = "wss://" + lbHost + wsPath + "?" + params.Encode()
+	}
+	return &Session{VMID: vmID, Endpoint: endpoint, AuthToken: authToken, Notary: notary, WSURL: wsURL, Cookies: opts.Cookies, CookieExpiry: opts.CookieExpiry}, nil
 }
 
 func (o *SessionOptions) requestJSON(ctx context.Context, method, path string, body any) (map[string]any, error) {
@@ -194,9 +208,21 @@ func (o *SessionOptions) requestJSON(ctx context.Context, method, path string, b
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if o.CookieExpiry == nil {
+		o.CookieExpiry = map[string]int64{}
+	}
 	for _, cookie := range resp.Cookies() {
-		if cookie.Name != "" && cookie.Value != "" {
-			o.Cookies[cookie.Name] = cookie.Value
+		if cookie.Name == "" || cookie.Value == "" {
+			continue
+		}
+		o.Cookies[cookie.Name] = cookie.Value
+		switch {
+		case cookie.MaxAge > 0:
+			o.CookieExpiry[cookie.Name] = time.Now().Add(time.Duration(cookie.MaxAge) * time.Second).Unix()
+		case cookie.MaxAge < 0:
+			delete(o.CookieExpiry, cookie.Name)
+		case !cookie.Expires.IsZero():
+			o.CookieExpiry[cookie.Name] = cookie.Expires.Unix()
 		}
 	}
 	payload, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
@@ -256,6 +282,11 @@ type AuthError struct {
 func (e *AuthError) Error() string {
 	return fmt.Sprintf("upstream auth error %d: %s", e.Status, e.Body)
 }
+
+// Unwrap lets account/session code classify 401/403 responses with
+// errors.Is(err, protocol.ErrSessionExpired). Without this, a dead cookie was
+// only recorded as "check unconfirmed" and the account stayed schedulable.
+func (e *AuthError) Unwrap() error { return protocol.ErrSessionExpired }
 
 func truncate(b []byte, n int) string {
 	if len(b) <= n {

@@ -9,8 +9,18 @@ import (
 	"muse2api/internal/storage"
 )
 
+func openTestStore(t *testing.T) *storage.Store {
+	t.Helper()
+	s, err := storage.Open(t.TempDir(), []byte("01234567890123456789012345678901"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	return s
+}
+
 func TestPoolNoEligibleAccountFailsFast(t *testing.T) {
-	s, _ := storage.Open(t.TempDir(), []byte("01234567890123456789012345678901"), false)
+	s := openTestStore(t)
 	a, _ := s.AddAccount("a", map[string]string{"hatch_sess": "s", "hatch_vml": "v", "hatch_native_auth_device": "d"}, nil)
 	_, _ = s.UpdateAccount(a.ID, func(a *model.Account) error { a.Enabled = false; return nil })
 	p := NewPool(s, 1)
@@ -22,7 +32,7 @@ func TestPoolNoEligibleAccountFailsFast(t *testing.T) {
 }
 
 func TestPoolSkipsExpiredAccount(t *testing.T) {
-	s, _ := storage.Open(t.TempDir(), []byte("01234567890123456789012345678901"), false)
+	s := openTestStore(t)
 	a, _ := s.AddAccount("a", map[string]string{"hatch_sess": "s", "hatch_vml": "v", "hatch_native_auth_device": "d"}, nil)
 	_, _ = s.UpdateAccount(a.ID, func(a *model.Account) error {
 		a.Status = model.AccountActive
@@ -38,7 +48,7 @@ func TestPoolSkipsExpiredAccount(t *testing.T) {
 }
 
 func TestPoolLimits(t *testing.T) {
-	s, _ := storage.Open(t.TempDir(), []byte("01234567890123456789012345678901"), false)
+	s := openTestStore(t)
 	a, _ := s.AddAccount("a", map[string]string{"hatch_sess": "s", "hatch_vml": "v", "hatch_native_auth_device": "d"}, nil)
 	_, _ = s.UpdateAccount(a.ID, func(a *model.Account) error { a.Status = model.AccountActive; return nil })
 	p := NewPool(s, 1)
@@ -60,7 +70,7 @@ func TestPoolLimits(t *testing.T) {
 }
 
 func TestPoolAcceptsTwoCoreCookieAccount(t *testing.T) {
-	s, _ := storage.Open(t.TempDir(), []byte("01234567890123456789012345678901"), false)
+	s := openTestStore(t)
 	a, err := s.AddAccount("two", map[string]string{"hatch_sess": "s", "hatch_vml": "v"}, nil)
 	if err != nil {
 		t.Fatal(err)

@@ -25,7 +25,9 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   if (!response.ok) {
     const record = body as { detail?: string; error?: { message?: string } | string } | null
     const message = record?.detail ?? (typeof record?.error === 'string' ? record.error : record?.error?.message) ?? `请求失败（HTTP ${response.status}）`
-    if (response.status === 401) window.dispatchEvent(new Event('muse2api:unauthorized'))
+    // A wrong password on the login form is also HTTP 401. Only a 401 from
+    // an authenticated admin route means the session itself expired.
+    if (response.status === 401 && path !== '/admin/login') window.dispatchEvent(new Event('muse2api:unauthorized'))
     throw new APIError(message, response.status, requestId)
   }
   return body as T

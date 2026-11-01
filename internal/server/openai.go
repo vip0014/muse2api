@@ -19,6 +19,7 @@ import (
 	"muse2api/internal/apierr"
 	"muse2api/internal/model"
 	"muse2api/internal/muse/protocol"
+	"muse2api/internal/scheduler"
 	"muse2api/internal/storage"
 )
 
@@ -170,13 +171,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, prompt, mode
 	}
 	ctx, cancel := context.WithTimeout(ctx, s.cfg.ChatTimeout)
 	defer cancel()
-	lease, err := s.pool.Acquire(ctx)
+	lease, err := s.pool.AcquireFor(ctx, scheduler.ClassChat)
 	if err != nil {
 		finish(model.TaskFailed, err)
 		apierr.Write(w, r, apierr.New(http.StatusServiceUnavailable, "account_unavailable", "没有可用上游账号或账号并发已满"))
 		return
 	}
 	defer lease.Release()
+	defer s.pool.Wake()
 	_, _ = s.store.UpdateTask(taskRecord.ID, func(t *model.Task) error { t.AccountID = lease.Account.ID; return nil })
 	events, err := s.driver.Chat(ctx, protocol.ChatRequest{Prompt: prompt, Model: modelName, AccountID: lease.Account.ID})
 	if err != nil {
@@ -434,12 +436,13 @@ func validateImage(req *imageAPIRequest) error {
 func (s *Server) generateImageSync(w http.ResponseWriter, r *http.Request, req imageAPIRequest, edit bool) {
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.ImageTimeout)
 	defer cancel()
-	lease, err := s.pool.Acquire(ctx)
+	lease, err := s.pool.AcquireFor(ctx, scheduler.ClassImage)
 	if err != nil {
 		apierr.Write(w, r, apierr.New(http.StatusServiceUnavailable, "account_unavailable", "没有可用上游账号或账号并发已满"))
 		return
 	}
 	defer lease.Release()
+	defer s.pool.Wake()
 	request := protocol.ImageRequest{
 		Prompt: req.Prompt, Model: resolveModel(req.Model, "muse-image"),
 		Size: req.Size, AspectRatio: req.AspectRatio,
@@ -453,6 +456,7 @@ func (s *Server) generateImageSync(w http.ResponseWriter, r *http.Request, req i
 		res, err = s.driver.GenerateImage(ctx, request)
 	}
 	if err != nil {
+		s.log.Warn("图片生成失败", "account", lease.Account.ID, "error", err)
 		apierr.Write(w, r, mapDriverError(err))
 		return
 	}
@@ -498,6 +502,9 @@ func (s *Server) imageEdits(w http.ResponseWriter, r *http.Request) {
 		if err := r.ParseMultipartForm(s.cfg.MaxUploadBytes); err != nil {
 			apierr.Write(w, r, apierr.BadRequest("multipart 请求无效或过大"))
 			return
+		}
+		if r.MultipartForm != nil {
+			defer r.MultipartForm.RemoveAll()
 		}
 		req.Prompt = r.FormValue("prompt")
 		req.Model = r.FormValue("model")
@@ -622,6 +629,9 @@ func (s *Server) getImageTask(w http.ResponseWriter, r *http.Request) {
 		res := &protocol.ImageResult{URL: t.URL}
 		res.Filename, _ = t.Result["filename"].(string)
 		res.Kind, _ = t.Result["kind"].(string)
+		if bytesValue, ok := t.Result["bytes"].(float64); ok {
+			res.Bytes = int64(bytesValue)
+		}
 		req := imageAPIRequest{Prompt: t.Prompt, Size: t.Size, ResponseFormat: t.ResponseFormat}
 		resp, err := s.imageResponse(req, res)
 		if err != nil {
@@ -793,10 +803,7 @@ func (s *Server) getMedia(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, r, apierr.NotFound("文件不存在"))
 		return
 	}
-	contentType := mime.TypeByExtension(filepath.Ext(name))
-	if contentType == "" {
-		contentType = "application/octet-stream"
-	}
+	contentType := mediaContentType(name)
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Content-Disposition", "inline; filename="+strconv.Quote(name))
 	if s.cfg.PublicMedia {
@@ -808,16 +815,63 @@ func (s *Server) getMedia(w http.ResponseWriter, r *http.Request) {
 	}
 	http.ServeContent(w, r, name, info.ModTime(), f)
 }
+func mediaContentType(name string) string {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".gif":
+		return "image/gif"
+	case ".webp":
+		return "image/webp"
+	case ".avif":
+		return "image/avif"
+	case ".mp4":
+		return "video/mp4"
+	case ".webm":
+		return "video/webm"
+	case ".mov":
+		return "video/quicktime"
+	}
+	if value := mime.TypeByExtension(strings.ToLower(filepath.Ext(name))); value != "" {
+		return value
+	}
+	return "application/octet-stream"
+}
+
 func mapDriverError(err error) error {
 	if errors.Is(err, protocol.ErrCapabilityUnavailable) {
 		return apierr.Capability(err.Error())
 	}
 	if errors.Is(err, protocol.ErrSessionExpired) {
-		return apierr.New(401, "auth_error", "上游 Session 已失效")
+		return apierr.New(409, "upstream_session_expired", "上游 Session 已失效，请更新账号凭据")
+	}
+	if errors.Is(err, protocol.ErrUpstreamTimeout) || errors.Is(err, context.DeadlineExceeded) {
+		return apierr.New(http.StatusGatewayTimeout, "upstream_timeout", "上游生成超时")
+	}
+	if errors.Is(err, protocol.ErrUpstreamUncertain) {
+		return apierr.New(http.StatusBadGateway, "upstream_uncertain", "上游结果未知；未自动重试，避免重复扣费")
+	}
+	var statusErr interface{ HTTPStatus() int }
+	if errors.As(err, &statusErr) {
+		switch statusErr.HTTPStatus() {
+		case http.StatusUnauthorized, http.StatusForbidden:
+			return apierr.New(http.StatusConflict, "upstream_session_expired", "上游会话已失效")
+		case http.StatusTooManyRequests:
+			return apierr.New(http.StatusTooManyRequests, "rate_limit_error", "上游限流，请稍后重试")
+		case http.StatusNotFound:
+			return apierr.New(http.StatusBadGateway, "upstream_not_found", "上游接口不存在")
+		default:
+			return apierr.New(http.StatusBadGateway, "upstream_error", fmt.Sprintf("上游返回 HTTP %d", statusErr.HTTPStatus()))
+		}
 	}
 	var refusal *protocol.ModelRefusalError
 	if errors.As(err, &refusal) {
 		return apierr.New(http.StatusBadGateway, "upstream_refusal", "上游拒绝生成媒体："+refusal.Message)
+	}
+	if errors.Is(err, protocol.ErrModelRefusal) {
+		return apierr.New(http.StatusBadGateway, "upstream_refusal", "上游拒绝生成媒体")
 	}
 	var up *protocol.UpstreamError
 	if errors.As(err, &up) {

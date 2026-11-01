@@ -11,6 +11,8 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"os"
+	"path/filepath"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -45,15 +47,28 @@ type Server struct {
 	apiKey       string
 	autoCheck    *autoChecker
 	keepalive    *keepaliver
+	checkLocks   sync.Map
 }
 
 func New(cfg config.Config, store *storage.Store, driver protocol.Driver, log *slog.Logger) *Server {
 	s := &Server{cfg: cfg, store: store, driver: driver, log: log, authLimiter: auth.NewLimiter(), loginLimiter: auth.NewLimiter(), sessions: auth.NewSessionManager(cfg.SessionTTL), adminUser: cfg.AdminUsername, adminPass: cfg.AdminPassword, apiKey: cfg.APIKey}
-	s.pool = scheduler.NewPool(store, cfg.Concurrency)
+	limits := map[scheduler.Class]int{}
+	if cfg.ChatConcurrency > 0 {
+		limits[scheduler.ClassChat] = cfg.ChatConcurrency
+	}
+	if cfg.ImageConcurrency > 0 {
+		limits[scheduler.ClassImage] = cfg.ImageConcurrency
+	}
+	if cfg.VideoConcurrency > 0 {
+		limits[scheduler.ClassVideo] = cfg.VideoConcurrency
+	}
+	s.pool = scheduler.NewPoolWithLimits(store, cfg.Concurrency, limits)
 	s.tasks = task.NewManager(store, task.ProcessorFunc(s.processTask), cfg.Concurrency, cfg.QueueSize)
 	s.autoCheck = newAutoChecker()
-	s.autoCheck.wg.Add(1)
-	go s.autoCheckWorker()
+	for i := 0; i < 4; i++ {
+		s.autoCheck.wg.Add(1)
+		go s.autoCheckWorker()
+	}
 	s.keepalive = newKeepaliver()
 	s.keepalive.wg.Add(1)
 	go s.keepaliveWorker()
@@ -143,6 +158,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /admin/tasks/{id}", s.deleteTask)
 	mux.HandleFunc("POST /admin/tasks/clear", s.clearTasks)
 	mux.HandleFunc("POST /admin/tasks/{id}/cancel", s.cancelTask)
+	mux.HandleFunc("POST /admin/tasks/{id}/retry", s.retryTask)
 	mux.HandleFunc("GET /admin/media", s.listMedia)
 	mux.HandleFunc("DELETE /admin/media/{name}", s.deleteMedia)
 	mux.HandleFunc("POST /admin/media/delete", s.deleteMediaBatch)
@@ -156,6 +172,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /admin/logs", s.logs)
 	mux.HandleFunc("GET /admin/logs/export", s.exportLogs)
 	mux.HandleFunc("GET /admin/capabilities", s.adminModels)
+	mux.HandleFunc("GET /admin/metrics", s.adminMetrics)
 	mux.HandleFunc("/", s.static)
 	return s.recoverMiddleware(s.requestMiddleware(mux))
 }
@@ -443,11 +460,18 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 	stats := s.store.AccountStats()
+	eligible := s.pool.EligibleCount()
 	status := "ready"
-	if stats["enabled"] == 0 {
+	if eligible == 0 {
 		status = "no_account"
 	}
-	writeJSON(w, 200, map[string]any{"status": status, "accounts": stats["enabled"], "protocol": "hatch-noise-protocol"})
+	writeJSON(w, 200, map[string]any{
+		"status":   status,
+		"accounts": stats["enabled"],
+		"eligible": eligible,
+		"queue":    s.tasks.Stats()["queue"],
+		"protocol": "hatch-noise-protocol",
+	})
 }
 func (s *Server) static(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
@@ -485,11 +509,16 @@ func (s *Server) processTask(ctx context.Context, t model.Task) (task.Result, er
 	// immediately when no eligible account exists; a busy account is a
 	// temporary condition and a queued task must not fail after a fixed
 	// short timeout while the single browser account is still generating.
-	lease, err := s.pool.Acquire(ctx)
+	class := scheduler.ClassImage
+	if t.Kind == "video" {
+		class = scheduler.ClassVideo
+	}
+	lease, err := s.pool.AcquireFor(ctx, class)
 	if err != nil {
 		return task.Result{}, err
 	}
 	defer lease.Release()
+	defer s.pool.Wake()
 	if _, err := s.store.UpdateTask(t.ID, func(current *model.Task) error { current.AccountID = lease.Account.ID; return nil }); err != nil {
 		s.store.AddEvent(model.Event{Level: "warning", Type: "task.account.bind", Message: "任务账号绑定持久化失败", TaskID: t.ID, AccountID: lease.Account.ID})
 	}
@@ -499,6 +528,7 @@ func (s *Server) processTask(ctx context.Context, t model.Task) (task.Result, er
 		if err != nil {
 			return task.Result{}, err
 		}
+		_ = s.store.RecordMedia(res.Filename, t.ID, res.Kind, "", res.Bytes)
 		return task.Result{MediaURL: res.URL, Data: map[string]any{"filename": res.Filename, "kind": res.Kind, "bytes": res.Bytes, "url": res.URL}}, nil
 	case "video":
 		created, err := s.driver.CreateVideo(ctx, protocol.VideoRequest{Prompt: t.APIPrompt, Model: t.Model, Size: t.Size, AspectRatio: t.AspectRatio, Resolution: t.Resolution, ReferenceImage: t.ReferenceImage, ReferenceImages: t.ReferenceImages, Duration: t.Duration, AccountID: lease.Account.ID})
@@ -509,6 +539,13 @@ func (s *Server) processTask(ctx context.Context, t model.Task) (task.Result, er
 			return task.Result{}, errors.New("上游任务尚未成功，不能标记完成")
 		}
 		data := map[string]any{"url": created.URL}
+		if created.Filename != "" {
+			data["filename"] = created.Filename
+			if info, statErr := os.Stat(filepath.Join(s.cfg.MediaDir(), created.Filename)); statErr == nil {
+				data["bytes"] = info.Size()
+			}
+			_ = s.store.RecordMedia(created.Filename, t.ID, "video", "", 0)
+		}
 		if created.DurationMS > 0 {
 			data["duration_ms"] = created.DurationMS
 		}

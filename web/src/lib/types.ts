@@ -17,6 +17,8 @@ export interface Account {
   last_error?: string
   note?: string
   max_concurrency: number
+  failure_count?: number
+  cooldown_until?: number
   quota?: { found?: boolean; plan?: string; weekly_reset?: string; weekly_used_pct?: number; extra_used_pct?: number; extra_left?: string; extra_expires?: string; checked_at?: number; error?: string }
 }
 

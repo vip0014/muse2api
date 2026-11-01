@@ -16,6 +16,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gorilla/websocket"
+
 	"muse2api/internal/model"
 	"muse2api/internal/muse/capabilities"
 	"muse2api/internal/muse/protocol"
@@ -31,6 +33,7 @@ type AccountStore interface {
 // DriverConfig configures the pure-protocol driver.
 type DriverConfig struct {
 	SiteURL       *url.URL
+	WSURL         string
 	MediaDir      string
 	PublicBase    string
 	ChatTimeout   time.Duration
@@ -38,6 +41,7 @@ type DriverConfig struct {
 	VideoTimeout  time.Duration
 	MaxMediaBytes int64
 	HTTPClient    *http.Client
+	WSDialer      *websocket.Dialer
 }
 
 // Driver implements protocol.Driver over the Noise/protobuf gateway.
@@ -79,7 +83,8 @@ func (d *Driver) clientFor(accountID string) *Client {
 	if client := d.clients[accountID]; client != nil {
 		return client
 	}
-	client := NewClient(d.cfg.SiteURL, d.cfg.HTTPClient)
+	client := NewClientWithWSURL(d.cfg.SiteURL, d.cfg.HTTPClient, d.cfg.WSURL)
+	client.SetWSDialer(d.cfg.WSDialer)
 	d.clients[accountID] = client
 	return client
 }
@@ -92,7 +97,7 @@ func (d *Driver) forgetAccount(accountID string) {
 	delete(d.clients, accountID)
 	d.clientsMu.Unlock()
 	if client != nil {
-		client.forgetConnection()
+		client.invalidate()
 	}
 }
 
@@ -111,7 +116,7 @@ func (d *Driver) credentials(accountID string) (protocol.AccountCredentials, err
 	if len(account.Cookies) == 0 {
 		return protocol.AccountCredentials{}, errors.New("账号没有 Cookie")
 	}
-	return protocol.AccountCredentials{ID: account.ID, Cookies: account.Cookies, CookieExpiry: account.CookieExpiry}, nil
+	return protocol.AccountCredentials{ID: account.ID, Cookies: account.Cookies, CookieExpiry: account.CookieExpiry, Version: account.CredentialsVersion}, nil
 }
 
 func (d *Driver) persist(creds protocol.AccountCredentials, opErr error) {
@@ -119,6 +124,9 @@ func (d *Driver) persist(creds protocol.AccountCredentials, opErr error) {
 		return
 	}
 	_, _ = d.store.UpdateAccount(creds.ID, func(a *model.Account) error {
+		if a.CredentialsVersion != creds.Version {
+			return errors.New("账号凭据已被其他操作更新，丢弃过期快照")
+		}
 		cookies := make(map[string]string, len(creds.Cookies))
 		for key, value := range creds.Cookies {
 			cookies[key] = value
@@ -132,14 +140,33 @@ func (d *Driver) persist(creds protocol.AccountCredentials, opErr error) {
 			a.CookieExpiry = expiry
 		}
 		a.LastUsed = time.Now().Unix()
-		if opErr == nil {
+		a.CredentialsVersion++
+		switch {
+		case opErr == nil:
 			a.Status = model.AccountActive
 			a.LastError = ""
-		} else if errors.Is(opErr, protocol.ErrSessionExpired) {
+			a.FailureCount = 0
+			a.CooldownUntil = 0
+			a.UseCount++
+		case errors.Is(opErr, protocol.ErrSessionExpired):
 			a.Status = model.AccountExpired
 			a.LastError = "上游 Session 已失效，请重新认证"
-		} else {
+			a.FailureCount = 0
+			a.CooldownUntil = 0
+		case errors.Is(opErr, protocol.ErrModelRefusal), errors.Is(opErr, context.Canceled):
 			a.Note = "最近执行未确认成功；保留会话状态"
+		default:
+			a.FailureCount++
+			cooldown := 30 * time.Second
+			for i := 1; i < a.FailureCount && cooldown < time.Hour; i++ {
+				cooldown *= 2
+			}
+			if cooldown > time.Hour {
+				cooldown = time.Hour
+			}
+			a.Status = model.AccountCooldown
+			a.CooldownUntil = time.Now().Add(cooldown).Unix()
+			a.LastError = truncate([]byte(opErr.Error()), 300)
 		}
 		return nil
 	})
@@ -163,6 +190,7 @@ func (d *Driver) Chat(ctx context.Context, request protocol.ChatRequest) (<-chan
 			return
 		}
 		var finalErr error
+		doneSeen := false
 		for delta := range stream {
 			if delta.Err != nil {
 				finalErr = delta.Err
@@ -179,8 +207,12 @@ func (d *Driver) Chat(ctx context.Context, request protocol.ChatRequest) (<-chan
 				}
 			}
 			if delta.Done {
+				doneSeen = true
 				break
 			}
+		}
+		if finalErr == nil && !doneSeen {
+			finalErr = fmt.Errorf("上游对话流在完成前结束: %w", protocol.ErrUpstreamUncertain)
 		}
 		if finalErr != nil {
 			d.persist(creds, finalErr)
@@ -233,8 +265,10 @@ func (d *Driver) CreateVideo(ctx context.Context, request protocol.VideoRequest)
 	if err != nil {
 		return nil, err
 	}
-	// Upstream accepts one starting frame for video turns.
-	items, err := referenceItems(protocol.ReferenceList(request.ReferenceImage, request.ReferenceImages), 1)
+	// Keep the attachment set and prompt description consistent. The previous
+	// implementation silently truncated the list to one item while the prompt
+	// still said "N ordered reference images".
+	items, err := referenceItems(protocol.ReferenceList(request.ReferenceImage, request.ReferenceImages), refimage.MaxImages)
 	if err != nil {
 		return nil, err
 	}
@@ -249,7 +283,7 @@ func (d *Driver) CreateVideo(ctx context.Context, request protocol.VideoRequest)
 		return nil, err
 	}
 	return &protocol.VideoTask{
-		ID: result.Filename, Status: "succeeded", Progress: 100, URL: result.URL,
+		ID: result.Filename, Filename: result.Filename, Status: "succeeded", Progress: 100, URL: result.URL,
 		DurationMS: result.DurationMS, Width: result.Width, Height: result.Height,
 	}, nil
 }
@@ -260,12 +294,12 @@ func (d *Driver) pickMedia(ctx context.Context, creds protocol.AccountCredential
 		if ref.Kind != expect {
 			continue
 		}
-		data, mimeType, err := d.clientFor(creds.ID).Download(ctx, creds.Cookies, ref)
+		path, mimeType, err := d.clientFor(creds.ID).DownloadToFile(ctx, creds.Cookies, ref, d.cfg.MediaDir, d.cfg.MaxMediaBytes)
 		if err != nil {
 			lastErr = err
 			continue
 		}
-		result, err := d.saveMedia(data, mimeType, expect)
+		result, err := d.saveMediaFile(path, mimeType, expect)
 		if err != nil {
 			lastErr = err
 			continue
@@ -288,7 +322,12 @@ func (d *Driver) GetVideoTask(context.Context, string) (*protocol.VideoTask, err
 }
 
 func (d *Driver) CheckSession(ctx context.Context, credentials protocol.AccountCredentials) (*protocol.Session, error) {
-	opts := SessionOptions{BaseURL: d.cfg.SiteURL, Cookies: credentials.Cookies, Client: d.cfg.HTTPClient}
+	opts := SessionOptions{
+		BaseURL:      d.cfg.SiteURL,
+		Cookies:      credentials.Cookies,
+		CookieExpiry: credentials.CookieExpiry,
+		Client:       d.cfg.HTTPClient,
+	}
 	info, err := opts.requestJSON(ctx, http.MethodGet, "/api/session", nil)
 	if err != nil {
 		return nil, err
@@ -299,7 +338,7 @@ func (d *Driver) CheckSession(ctx context.Context, credentials protocol.AccountC
 		VMID:         asString(info["vm_id"]),
 		VMState:      asString(info["vm_state"]),
 		Cookies:      opts.Cookies,
-		CookieExpiry: credentials.CookieExpiry,
+		CookieExpiry: opts.CookieExpiry,
 		CheckedAt:    time.Now().Unix(),
 	}, nil
 }
@@ -319,7 +358,7 @@ func (d *Driver) Close() error {
 	d.clients = map[string]*Client{}
 	d.clientsMu.Unlock()
 	for _, client := range clients {
-		client.forgetConnection()
+		client.invalidate()
 	}
 	return nil
 }
@@ -368,15 +407,29 @@ func referenceExtension(mimeType string) string {
 	}
 }
 
-func (d *Driver) saveMedia(data []byte, mimeType, expect string) (*protocol.ImageResult, error) {
-	if len(data) == 0 || int64(len(data)) > d.cfg.MaxMediaBytes {
+func (d *Driver) saveMediaFile(path, mimeType, expect string) (*protocol.ImageResult, error) {
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return nil, errors.New("媒体临时文件不存在")
+	}
+	if info.Size() <= 0 || info.Size() > d.cfg.MaxMediaBytes {
+		_ = os.Remove(path)
 		return nil, errors.New("媒体内容为空或超过大小限制")
 	}
-	kind, detectedMIME, ext := detectMediaType(data)
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	head := make([]byte, 512)
+	n, _ := file.Read(head)
+	_ = file.Close()
+	kind, detectedMIME, ext := detectMediaType(head[:n])
 	if kind == "" {
+		_ = os.Remove(path)
 		return nil, errors.New("无法识别媒体类型，拒绝交付不可验证的文件")
 	}
 	if expect != "" && kind != expect {
+		_ = os.Remove(path)
 		return nil, fmt.Errorf("期望生成 %s，但提取结果为 %s，拒绝交付错误类型", expect, kind)
 	}
 	if mimeType == "" {
@@ -384,32 +437,25 @@ func (d *Driver) saveMedia(data []byte, mimeType, expect string) (*protocol.Imag
 	}
 	name, err := randomMediaName(ext)
 	if err != nil {
+		_ = os.Remove(path)
 		return nil, err
 	}
 	if err := os.MkdirAll(d.cfg.MediaDir, 0o700); err != nil {
+		_ = os.Remove(path)
 		return nil, err
 	}
-	tmp, err := os.CreateTemp(d.cfg.MediaDir, ".download-*")
-	if err != nil {
-		return nil, err
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return nil, err
-	}
-	if err := tmp.Close(); err != nil {
-		return nil, err
-	}
-	if err := os.Rename(tmpName, filepath.Join(d.cfg.MediaDir, name)); err != nil {
+	final := filepath.Join(d.cfg.MediaDir, name)
+	if err := os.Rename(path, final); err != nil {
+		_ = os.Remove(path)
 		return nil, err
 	}
 	base := strings.TrimRight(d.cfg.PublicBase, "/")
-	result := &protocol.ImageResult{Filename: name, Kind: kind, URL: base + "/v1/media/" + name, Bytes: int64(len(data))}
-	if kind == "video" {
-		if durationMS, width, height, ok := probeMP4Metadata(data); ok {
-			result.DurationMS, result.Width, result.Height = durationMS, width, height
+	result := &protocol.ImageResult{Filename: name, Kind: kind, URL: base + "/v1/media/" + name, Bytes: info.Size()}
+	if kind == "video" && info.Size() <= 128<<20 {
+		if data, readErr := os.ReadFile(final); readErr == nil {
+			if durationMS, width, height, ok := probeMP4Metadata(data); ok {
+				result.DurationMS, result.Width, result.Height = durationMS, width, height
+			}
 		}
 	}
 	return result, nil

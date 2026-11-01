@@ -10,7 +10,7 @@ services:
     restart: unless-stopped
     # The app bounds HTTP shutdown (20s), task shutdown (10s) and driver close
     # (3s); keep headroom above that total.
-    stop_grace_period: 50s
+    stop_grace_period: 70s
     # Override only when the host data directory is owned by another UID/GID.
     user: "${MUSE2API_UID:-10001}:${MUSE2API_GID:-10001}"
     ports:
@@ -36,6 +36,9 @@ services:
       MUSE2API_PUBLIC_BASE: "${MUSE2API_PUBLIC_BASE:-}"
       MUSE2API_SITE: "${MUSE2API_SITE:-https://muse.ai}"
       MUSE2API_CONCURRENCY: "${MUSE2API_CONCURRENCY:-2}"
+      MUSE2API_CHAT_CONCURRENCY: "${MUSE2API_CHAT_CONCURRENCY:-0}"
+      MUSE2API_IMAGE_CONCURRENCY: "${MUSE2API_IMAGE_CONCURRENCY:-0}"
+      MUSE2API_VIDEO_CONCURRENCY: "${MUSE2API_VIDEO_CONCURRENCY:-1}"
       MUSE2API_QUEUE_SIZE: "${MUSE2API_QUEUE_SIZE:-64}"
       MUSE2API_IMAGE_TIMEOUT: "${MUSE2API_IMAGE_TIMEOUT:-240}"
       MUSE2API_VIDEO_TIMEOUT: "${MUSE2API_VIDEO_TIMEOUT:-600}"

@@ -36,6 +36,7 @@ type Manager struct {
 	wg        sync.WaitGroup
 	mu        sync.Mutex
 	cancels   map[string]context.CancelFunc
+	enqueued  map[string]bool
 	closed    atomic.Bool
 	closeOnce sync.Once
 	done      chan struct{}
@@ -43,22 +44,77 @@ type Manager struct {
 
 func NewManager(store *storage.Store, processor Processor, workers, queueSize int) *Manager {
 	ctx, cancel := context.WithCancel(context.Background())
-	m := &Manager{store: store, processor: processor, queue: make(chan string, queueSize), root: ctx, cancel: cancel, cancels: map[string]context.CancelFunc{}, done: make(chan struct{})}
+	m := &Manager{store: store, processor: processor, queue: make(chan string, queueSize), root: ctx, cancel: cancel, cancels: map[string]context.CancelFunc{}, enqueued: map[string]bool{}, done: make(chan struct{})}
 	for i := 0; i < workers; i++ {
 		m.wg.Add(1)
 		go m.worker()
 	}
+	m.wg.Add(1)
+	go m.refillLoop()
 	return m
 }
 func (m *Manager) Enqueue(id string) error {
 	if m.closed.Load() {
 		return ErrClosed
 	}
+	m.mu.Lock()
+	if m.enqueued[id] {
+		m.mu.Unlock()
+		return nil
+	}
+	m.enqueued[id] = true
+	m.mu.Unlock()
 	select {
 	case m.queue <- id:
 		return nil
 	default:
+		m.mu.Lock()
+		delete(m.enqueued, id)
+		m.mu.Unlock()
 		return apierr.QueueFull()
+	}
+}
+
+func (m *Manager) refillLoop() {
+	defer m.wg.Done()
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	m.refill()
+	for {
+		select {
+		case <-m.root.Done():
+			return
+		case <-ticker.C:
+			m.refill()
+		}
+	}
+}
+
+func (m *Manager) refill() {
+	if m.closed.Load() {
+		return
+	}
+	for _, id := range m.store.QueuedTaskIDs(256, "image", "video") {
+		m.mu.Lock()
+		if m.enqueued[id] {
+			m.mu.Unlock()
+			continue
+		}
+		m.enqueued[id] = true
+		m.mu.Unlock()
+		select {
+		case m.queue <- id:
+		case <-m.root.Done():
+			m.mu.Lock()
+			delete(m.enqueued, id)
+			m.mu.Unlock()
+			return
+		default:
+			m.mu.Lock()
+			delete(m.enqueued, id)
+			m.mu.Unlock()
+			return
+		}
 	}
 }
 func (m *Manager) worker() {
@@ -81,14 +137,32 @@ func (m *Manager) run(id string) {
 	started := time.Now()
 	t, err := m.store.ClaimTask(id)
 	if err != nil {
+		m.mu.Lock()
+		delete(m.enqueued, id)
+		m.mu.Unlock()
 		return
 	}
 	ctx, cancel := context.WithCancel(m.root)
 	m.mu.Lock()
 	m.cancels[id] = cancel
 	m.mu.Unlock()
-	defer func() { cancel(); m.mu.Lock(); delete(m.cancels, id); m.mu.Unlock() }()
+	if t.CancelRequested {
+		cancel()
+	}
+	defer func() {
+		cancel()
+		m.mu.Lock()
+		delete(m.cancels, id)
+		delete(m.enqueued, id)
+		m.mu.Unlock()
+	}()
 	result, runErr := m.processSafe(ctx, t)
+	// processTask persists the account binding while it waits for a lease.
+	// Reload so shutdown/cancel handling sees whether the task ever reached an
+	// upstream account.
+	if current, err := m.store.GetTask(id); err == nil {
+		t = current
+	}
 	_, updateErr := m.store.UpdateTask(id, func(t *model.Task) error {
 		t.CompletedAt = time.Now().Unix()
 		t.Elapsed = time.Since(started).Seconds()
@@ -98,11 +172,20 @@ func (m *Manager) run(id string) {
 				t.Status = model.TaskCancelled
 				t.Error = "本地执行已取消；无法保证上游任务同步取消"
 			case errors.Is(runErr, context.Canceled) && m.root.Err() != nil:
-				// Shutdown is not a task failure: upstream may still have
-				// produced a result, so keep the task undecided instead of
-				// falsely recording failure and never retrying it.
-				t.Status = model.TaskUnknown
-				t.Error = "服务关闭导致本地执行中断，上游结果未知；未自动重试"
+				if t.AccountID == "" {
+					// The worker was still waiting for an account lease and had
+					// not submitted anything upstream. Preserve the task for the
+					// next process instead of marking it unknown.
+					t.Status = model.TaskQueued
+					t.Progress = 0
+					t.StartedAt = 0
+					t.CompletedAt = 0
+					t.Error = "服务关闭前尚未分配账号，已重新排队"
+				} else {
+					// Upstream may already have produced (and charged) a result.
+					t.Status = model.TaskUnknown
+					t.Error = "服务关闭导致本地执行中断，上游结果未知；未自动重试"
+				}
 			default:
 				t.Status = model.TaskFailed
 				t.Error = safeError(runErr)
@@ -113,6 +196,7 @@ func (m *Manager) run(id string) {
 		}
 		t.Status = model.TaskSucceeded
 		t.Progress = 100
+		t.Error = ""
 		t.URL = result.MediaURL
 		t.Result = result.Data
 		t.ReferenceImage = ""
@@ -131,6 +215,10 @@ func (m *Manager) processSafe(ctx context.Context, t model.Task) (result Result,
 	}()
 	return m.processor.Process(ctx, t)
 }
+func (m *Manager) Stats() map[string]int {
+	return map[string]int{"queue": len(m.queue), "capacity": cap(m.queue)}
+}
+
 func (m *Manager) Cancel(id string) error {
 	t, err := m.store.GetTask(id)
 	if err != nil {

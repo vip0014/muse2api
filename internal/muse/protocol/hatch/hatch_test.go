@@ -2,7 +2,10 @@ package hatch
 
 import (
 	"bytes"
+	"errors"
 	"testing"
+
+	"muse2api/internal/muse/protocol"
 )
 
 func TestNoiseXXHandshakeAndSplit(t *testing.T) {
@@ -171,4 +174,50 @@ func TestServiceRequestEnvelope(t *testing.T) {
 	if len(env) == 0 {
 		t.Fatalf("empty envelope")
 	}
+}
+
+func TestAuthErrorMapsToSessionExpired(t *testing.T) {
+	if !errors.Is(&AuthError{Status: 401}, protocol.ErrSessionExpired) {
+		t.Fatal("401 AuthError must classify as session expired")
+	}
+}
+
+func TestMediaRefusalMapsToModelRefusal(t *testing.T) {
+	if !errors.Is(&MediaRefusalError{Message: "no"}, protocol.ErrModelRefusal) {
+		t.Fatal("media refusal must classify as model refusal")
+	}
+}
+
+func TestExtractMediaIsStable(t *testing.T) {
+	events := []map[string]any{{
+		"payload": map[string]any{
+			"kind": "image",
+			"resources": []any{
+				map[string]any{"path": "sandbox://a.png", "kind": "image"},
+				map[string]any{"path": "sandbox://b.png", "kind": "image"},
+				map[string]any{"path": "sandbox://c.png", "kind": "image"},
+			},
+		},
+	}}
+	want := []string{"a.png", "b.png", "c.png"}
+	for i := 0; i < 50; i++ {
+		got := extractMedia(events)
+		if len(got) != len(want) {
+			t.Fatalf("got %d refs", len(got))
+		}
+		for index := range want {
+			if got[index].Path != want[index] {
+				t.Fatalf("unstable order at %d: %+v", index, got)
+			}
+		}
+	}
+}
+
+func TestFinishedStreamIgnoresLateChunks(t *testing.T) {
+	s := newStream(1, true)
+	s.finish(errors.New("closed"))
+	if s.feedRecord([]byte(`{"event":"delta.text_append"}`)) {
+		t.Fatal("finished stream accepted a record")
+	}
+	s.finish(errors.New("again"))
 }

@@ -13,7 +13,7 @@ Environment=HOME=/opt/muse2api/data
 ExecStart=/opt/muse2api/bin/muse2api
 Restart=on-failure
 RestartSec=5
-TimeoutStopSec=45s
+TimeoutStopSec=70s
 UMask=0077
 LimitNOFILE=65536
 NoNewPrivileges=true

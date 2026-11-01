@@ -23,6 +23,9 @@ type Config struct {
 	SiteURL                  string
 	CORSOrigins              []string
 	Concurrency              int
+	ChatConcurrency          int
+	ImageConcurrency         int
+	VideoConcurrency         int
 	QueueSize                int
 	ImageTimeout             time.Duration
 	VideoTimeout             time.Duration
@@ -84,7 +87,7 @@ func Load(homeOverride string) (Config, error) {
 	}
 	c := Config{
 		Home:                     abs,
-		Host:                     env("MUSE2API_HOST", "0.0.0.0"),
+		Host:                     env("MUSE2API_HOST", "127.0.0.1"),
 		APIKey:                   apiKey,
 		PublicBase:               strings.TrimRight(os.Getenv("MUSE2API_PUBLIC_BASE"), "/"),
 		SiteURL:                  env("MUSE2API_SITE", "https://muse.ai"),
@@ -112,6 +115,15 @@ func Load(homeOverride string) (Config, error) {
 		return Config{}, err
 	}
 	if c.Concurrency, err = intEnv("MUSE2API_CONCURRENCY", 2, 1, 128); err != nil {
+		return Config{}, err
+	}
+	if c.ChatConcurrency, err = intEnv("MUSE2API_CHAT_CONCURRENCY", 0, 0, 128); err != nil {
+		return Config{}, err
+	}
+	if c.ImageConcurrency, err = intEnv("MUSE2API_IMAGE_CONCURRENCY", 0, 0, 128); err != nil {
+		return Config{}, err
+	}
+	if c.VideoConcurrency, err = intEnv("MUSE2API_VIDEO_CONCURRENCY", 0, 0, 128); err != nil {
 		return Config{}, err
 	}
 	if c.QueueSize, err = intEnv("MUSE2API_QUEUE_SIZE", 64, 1, 10000); err != nil {

@@ -8,10 +8,12 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"muse2api/internal/apierr"
@@ -19,11 +21,13 @@ import (
 	"muse2api/internal/config"
 	"muse2api/internal/model"
 	"muse2api/internal/muse/protocol"
+	"muse2api/internal/scheduler"
 	"muse2api/internal/storage"
 )
 
 type overviewTaskStats struct {
 	RequestsToday  int `json:"requests_today"`
+	Completed      int `json:"completed"`
 	ImageTotal     int `json:"image_total"`
 	ImageSucceeded int `json:"image_succeeded"`
 	VideoTotal     int `json:"video_total"`
@@ -39,7 +43,7 @@ func (s *Server) adminStatus(w http.ResponseWriter, r *http.Request) {
 	today := time.Now().Unix() - 86400
 	counts := s.store.TaskCounts(today)
 	stats := overviewTaskStats{
-		RequestsToday: counts.RequestsToday, Running: counts.Running, Queued: counts.Queued,
+		RequestsToday: counts.RequestsToday, Running: counts.Running, Queued: counts.Queued, Completed: counts.Completed,
 		ImageTotal: counts.ImageTotal, ImageSucceeded: counts.ImageSucceeded,
 		VideoTotal: counts.VideoTotal, VideoSucceeded: counts.VideoSucceeded,
 	}
@@ -141,6 +145,7 @@ func parseCookies(text string) map[string]string {
 	return out
 }
 func (s *Server) patchAccount(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
 	var in struct {
 		Label          *string `json:"label"`
 		Enabled        *bool   `json:"enabled"`
@@ -150,7 +155,7 @@ func (s *Server) patchAccount(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, r, err)
 		return
 	}
-	a, err := s.store.UpdateAccount(r.PathValue("id"), func(a *model.Account) error {
+	a, err := s.store.UpdateAccount(id, func(a *model.Account) error {
 		if in.Label != nil {
 			if strings.TrimSpace(*in.Label) == "" {
 				return errors.New("标签不能为空")
@@ -174,12 +179,23 @@ func (s *Server) patchAccount(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			apierr.Write(w, r, apierr.NotFound("账号不存在"))
+			return
+		}
 		apierr.Write(w, r, err)
 		return
+	}
+	if in.Enabled != nil && !*in.Enabled {
+		// A disabled account must not keep a live gateway connection (and its
+		// VM) around. The bulk path already did this; the single PATCH path
+		// previously leaked it.
+		s.invalidateAccount(id)
 	}
 	s.pool.Wake()
 	writeJSON(w, 200, a)
 }
+
 // accountInvalidator is implemented by drivers that hold per-account
 // connections. Dropping the account forces a fresh bootstrap with the current
 // cookies and stops the old VM connection from being reused.
@@ -269,12 +285,18 @@ func (s *Server) updateCookies(w http.ResponseWriter, r *http.Request) {
 		a.LastError = ""
 		a.Note = "凭据已更新，等待验证"
 		a.ExpiresAt = 0
+		a.ExpiryEstimated = false
+		a.CredentialsVersion++
 		return nil
 	})
 	if err == nil {
 		s.store.AddEvent(model.Event{Level: "info", Type: "account.credentials.update", Message: "账号凭据已更新", RequestID: requestIDFrom(r.Context()), AccountID: a.ID})
 	}
 	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			apierr.Write(w, r, apierr.NotFound("账号不存在"))
+			return
+		}
 		apierr.Write(w, r, err)
 		return
 	}
@@ -291,6 +313,13 @@ type sessionCheckResult struct {
 }
 
 func (s *Server) checkAndStoreSession(ctx context.Context, account model.Account) sessionCheckResult {
+	// Auto-check, keepalive and manual test can target the same account.
+	// Single-flight it so two stale snapshots cannot race and write back
+	// different cookie rotations.
+	value, _ := s.checkLocks.LoadOrStore(account.ID, &sync.Mutex{})
+	lock := value.(*sync.Mutex)
+	lock.Lock()
+	defer lock.Unlock()
 	session, checkErr := s.driver.CheckSession(ctx, protocol.AccountCredentials{ID: account.ID, Cookies: account.Cookies, CookieExpiry: account.CookieExpiry})
 	ok := checkErr == nil && session != nil && session.Valid
 	if _, err := s.store.UpdateAccount(account.ID, func(a *model.Account) error {
@@ -300,27 +329,47 @@ func (s *Server) checkAndStoreSession(ctx context.Context, account model.Account
 			a.OK = boolPtr(true)
 			a.LastError = ""
 			a.Note = "会话有效"
-			if len(session.Cookies) > 0 {
+			a.FailureCount = 0
+			a.CooldownUntil = 0
+			if len(session.Cookies) > 0 && a.CredentialsVersion == account.CredentialsVersion {
 				a.Cookies = session.Cookies
 				a.CookieExpiry = session.CookieExpiry
+				a.CredentialsVersion++
 			}
 			if exp := session.CookieExpiry["hatch_vml"]; exp > 0 {
 				a.ExpiresAt = exp
 				a.ExpiryEstimated = false
 			}
+			// A successful check proves the session is alive now. Never
+			// re-introduce a CreatedAt-based estimate as a hard expiry.
 			a.LastKeepalive = time.Now().Unix()
 		} else if errors.Is(checkErr, protocol.ErrSessionExpired) {
 			a.Status = model.AccountExpired
 			a.OK = boolPtr(false)
 			a.LastError = "会话已失效，请重新认证"
+			a.FailureCount = 0
+			a.CooldownUntil = 0
 		} else {
+			a.FailureCount++
+			cooldown := 30 * time.Second
+			for i := 1; i < a.FailureCount && cooldown < time.Hour; i++ {
+				cooldown *= 2
+			}
+			if cooldown > time.Hour {
+				cooldown = time.Hour
+			}
+			a.Status = model.AccountCooldown
+			a.CooldownUntil = time.Now().Add(cooldown).Unix()
 			a.LastError = safeUpstreamError(checkErr)
-			a.Note = "检测未确认，保留此前有效状态"
+			a.Note = "检测失败，账号进入冷却"
 		}
 		return nil
 	}); err != nil {
 		s.log.Warn("会话检测写入失败", "account", account.ID, "error", err)
 	}
+	// A session check changes status/expiry, so the scheduler index must see
+	// the new eligibility immediately instead of on its next refresh.
+	s.pool.Wake()
 	message := safeUpstreamError(checkErr)
 	if ok {
 		message = "会话有效"
@@ -393,7 +442,7 @@ func (s *Server) queryQuota(ctx context.Context, driver quotaDriver, credentials
 
 func mapQuotaError(err error) error {
 	if errors.Is(err, protocol.ErrSessionExpired) {
-		return apierr.New(http.StatusUnauthorized, "auth_error", "上游 Session 已失效，请重新导入 Cookie")
+		return apierr.New(http.StatusConflict, "upstream_session_expired", "上游 Session 已失效，请重新导入 Cookie")
 	}
 	var upstream *protocol.UpstreamError
 	if errors.As(err, &upstream) {
@@ -419,7 +468,7 @@ func (s *Server) quotaAny(w http.ResponseWriter, r *http.Request) {
 	// Never hold the request open while a generation lease is occupied; the
 	// admin refresh button must fail fast with a clear message.
 	acquireCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	lease, err := s.pool.Acquire(acquireCtx)
+	lease, err := s.pool.AcquireFor(acquireCtx, scheduler.ClassAdmin)
 	cancel()
 	if err != nil {
 		apierr.Write(w, r, apierr.New(http.StatusServiceUnavailable, "account_unavailable", "账号正忙或不可用，请稍后刷新"))
@@ -477,7 +526,32 @@ func (s *Server) cancelTask(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "message": "本地取消已处理；不代表上游任务已停止"})
 }
+func (s *Server) retryTask(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Force bool `json:"force"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&in)
+	t, err := s.store.RequeueTask(r.PathValue("id"), in.Force)
+	if err != nil {
+		switch {
+		case errors.Is(err, storage.ErrNotFound):
+			apierr.Write(w, r, apierr.NotFound("任务不存在"))
+		case errors.Is(err, storage.ErrConflict):
+			apierr.Write(w, r, apierr.New(409, "invalid_request_error", err.Error()))
+		default:
+			apierr.Write(w, r, err)
+		}
+		return
+	}
+	if err := s.tasks.Enqueue(t.ID); err != nil {
+		apierr.Write(w, r, err)
+		return
+	}
+	writeJSON(w, 202, map[string]any{"ok": true, "task": legacyTask(t), "message": "任务已重新排队；可能重新消耗上游额度"})
+}
+
 func legacyTask(t model.Task) model.Task {
+	t.TaskID = t.ID
 	t.ReferenceImage = ""
 	t.ReferenceImages = nil
 	switch t.Status {
@@ -493,6 +567,7 @@ func safeMediaName(name string) bool {
 }
 
 func (s *Server) mediaItems() ([]model.Media, error) {
+	taskIDs := s.store.MediaTaskIDs()
 	entries, err := os.ReadDir(s.cfg.MediaDir())
 	if err != nil {
 		return nil, err
@@ -516,7 +591,7 @@ func (s *Server) mediaItems() ([]model.Media, error) {
 		if ext == ".jpg" {
 			mime = "image/jpeg"
 		}
-		items = append(items, model.Media{Name: e.Name(), URL: "/v1/media/" + e.Name(), Bytes: info.Size(), ModTime: info.ModTime().Unix(), Kind: kind, MIME: mime})
+		items = append(items, model.Media{Name: e.Name(), URL: "/v1/media/" + e.Name(), Bytes: info.Size(), ModTime: info.ModTime().Unix(), Kind: kind, MIME: mime, TaskID: taskIDs[e.Name()]})
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].ModTime > items[j].ModTime })
 	return items, nil
@@ -556,6 +631,7 @@ func (s *Server) deleteMedia(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, r, apierr.NotFound("文件不存在或删除失败"))
 		return
 	}
+	s.store.DeleteMediaRecord(name)
 	s.store.AddEvent(model.Event{Level: "info", Type: "media.delete", Message: "媒体文件已删除", RequestID: requestIDFrom(r.Context())})
 	writeJSON(w, 200, map[string]any{"status": "ok", "deleted": name})
 }
@@ -575,6 +651,7 @@ func (s *Server) deleteMediaBatch(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if err := os.Remove(filepath.Join(s.cfg.MediaDir(), name)); err == nil {
+			s.store.DeleteMediaRecord(name)
 			removed++
 		} else {
 			failures = append(failures, name)
@@ -584,6 +661,32 @@ func (s *Server) deleteMediaBatch(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) adminModels(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"data": s.driver.Capabilities(r.Context())})
+}
+
+func (s *Server) adminMetrics(w http.ResponseWriter, r *http.Request) {
+	active, leases := s.pool.Stats()
+	var mem runtime.MemStats
+	runtime.ReadMemStats(&mem)
+	writeJSON(w, 200, map[string]any{
+		"accounts": map[string]any{
+			"stats":    s.store.AccountStats(),
+			"eligible": s.pool.EligibleCount(),
+		},
+		"scheduler": map[string]any{
+			"active": active,
+			"leases": leases,
+			"class":  s.pool.ClassStats(),
+		},
+		"tasks": map[string]any{
+			"queue":  s.tasks.Stats(),
+			"counts": s.store.TaskCounts(time.Now().Unix() - 86400),
+		},
+		"runtime": map[string]any{
+			"goroutines": runtime.NumGoroutine(),
+			"heap_bytes": mem.HeapAlloc,
+			"sys_bytes":  mem.Sys,
+		},
+	})
 }
 func publicConfig(c config.Config) map[string]any {
 	return map[string]any{"host": c.Host, "port": c.Port, "public_base": c.PublicBase, "site": c.SiteURL, "concurrency": c.Concurrency, "queue_size": c.QueueSize, "image_timeout": int(c.ImageTimeout.Seconds()), "video_timeout": int(c.VideoTimeout.Seconds()), "chat_timeout": int(c.ChatTimeout.Seconds()), "media_dir": "data/media", "media_retention": "manual", "log_level": c.LogLevel, "credential_encryption": len(c.CredentialKey) == 32, "public_media": c.PublicMedia, "admin_username": c.AdminUsername, "session_ttl": int(c.SessionTTL.Seconds()), "trust_proxy": c.TrustProxy, "max_upload_bytes": c.MaxUploadBytes, "ref_image_local_files": c.RefImageLocalFiles, "ref_image_private_fetch": c.RefImagePrivateFetch}
@@ -617,22 +720,17 @@ func (s *Server) restore(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, r, err)
 		return
 	}
-	for _, name := range []string{"accounts.secure.json", "api_key.secure", "tasks.json", "events.json"} {
-		b, err := os.ReadFile(filepath.Join(dir, name))
-		if os.IsNotExist(err) {
-			continue
-		}
-		if err != nil {
-			apierr.Write(w, r, err)
-			return
-		}
-		if err := os.WriteFile(filepath.Join(s.cfg.DataDir(), name), b, 0o600); err != nil {
-			apierr.Write(w, r, err)
-			return
-		}
+	if err := s.store.StageRestore(r.Context(), dir); err != nil {
+		apierr.Write(w, r, apierr.BadRequest(err.Error()))
+		return
 	}
-	writeJSON(w, 200, map[string]any{"ok": true, "restart_required": true})
+	writeJSON(w, 200, map[string]any{
+		"ok":               true,
+		"restart_required": true,
+		"message":          "备份已校验并暂存；重启服务后生效。当前进程不会继续写入恢复后的数据库。",
+	})
 }
+
 func maskAPIKey(key string) string {
 	if key == "" {
 		return ""
@@ -670,7 +768,10 @@ func (s *Server) revealAPIKey(w http.ResponseWriter, r *http.Request) {
 		}
 		s.loginLimiter.Fail(r, s.cfg.TrustProxy)
 		s.store.AddEvent(model.Event{Level: "warning", Type: "security.key.reveal_denied", Message: "API Key 查看密码验证失败", RequestID: requestIDFrom(r.Context())})
-		apierr.Write(w, r, apierr.New(http.StatusUnauthorized, "authentication_error", "管理员密码错误"))
+		// 403 is deliberately distinct from an invalid admin session (401):
+		// the frontend must not log the whole console out after a mistyped
+		// re-authentication password.
+		apierr.Write(w, r, apierr.New(http.StatusForbidden, "reauth_failed", "管理员密码错误"))
 		return
 	}
 	s.loginLimiter.Reset(r, s.cfg.TrustProxy)
@@ -690,11 +791,14 @@ func (s *Server) rotateAPIKey(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, r, err)
 		return
 	}
+	// Keep disk and in-memory key in the same critical section; two
+	// concurrent rotations must not leave them disagreeing.
+	s.keyMu.Lock()
 	if err := s.store.SaveAPIKey(key); err != nil {
+		s.keyMu.Unlock()
 		apierr.Write(w, r, err)
 		return
 	}
-	s.keyMu.Lock()
 	s.apiKey = key
 	s.keyMu.Unlock()
 	s.store.AddEvent(model.Event{Level: "info", Type: "security.key.rotate", Message: "API Key 已轮换，旧 Key 已失效；新 Key 已加密持久化", RequestID: requestIDFrom(r.Context())})

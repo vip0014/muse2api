@@ -14,3 +14,6 @@
 !/internal/server/static/index.html
 *.log
 coverage.out
+
+# local agent runtime state
+.zcode/

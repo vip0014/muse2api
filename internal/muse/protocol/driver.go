@@ -11,6 +11,8 @@ import (
 var ErrCapabilityUnavailable = errors.New("capability unavailable")
 var ErrSessionExpired = errors.New("session expired")
 var ErrModelRefusal = errors.New("model refused media generation")
+var ErrUpstreamTimeout = errors.New("upstream timeout")
+var ErrUpstreamUncertain = errors.New("upstream result uncertain")
 
 // ModelRefusalError means Muse completed the turn with text instead of media.
 // The original text is preserved so callers can see region/availability
@@ -52,6 +54,7 @@ type VideoRequest struct {
 }
 type VideoTask struct {
 	ID         string
+	Filename   string
 	Status     string
 	Progress   int
 	URL        string
@@ -71,6 +74,7 @@ type AccountCredentials struct {
 	ID           string
 	Cookies      map[string]string
 	CookieExpiry map[string]int64
+	Version      int64
 }
 
 type Driver interface {

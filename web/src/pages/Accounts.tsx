@@ -226,6 +226,8 @@ function AccountInspector({ account, busy, onTest, onQuota, onReauth, onEdit, on
           <Detail label="并发上限" value={`${account.max_concurrency} 个任务`} />
           <Detail label="累计调用" value={`${account.use_count} 次`} />
           <Detail label="到期时间" value={`${fullDate(account.expires_at)}${account.expires_estimated ? '（估算）' : ''}`} />
+          {account.cooldown_until ? <Detail label="冷却至" value={fullDate(account.cooldown_until)} /> : null}
+          {account.failure_count ? <Detail label="连续失败" value={`${account.failure_count} 次`} /> : null}
           <Detail label="最后使用" value={fullDate(account.last_used)} />
           <Detail label="最后检测" value={fullDate(account.checked_at)} />
           <Detail label="创建时间" value={fullDate(account.created_at)} />

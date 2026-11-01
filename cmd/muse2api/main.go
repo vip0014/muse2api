@@ -11,6 +11,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/gorilla/websocket"
+
 	"muse2api/internal/config"
 	"muse2api/internal/muse/protocol/hatch"
 	"muse2api/internal/server"
@@ -52,14 +54,30 @@ func main() {
 		logger.Error("上游站点地址无效", "error", err)
 		os.Exit(1)
 	}
+	httpClient, err := upstreamHTTPClient(cfg)
+	if err != nil {
+		logger.Error("上游 HTTP 客户端初始化失败", "error", err)
+		os.Exit(1)
+	}
+	wsDialer := &websocket.Dialer{HandshakeTimeout: 20 * time.Second, Proxy: http.ProxyFromEnvironment}
+	if cfg.ProxyURL != "" {
+		proxyURL, proxyErr := url.Parse(cfg.ProxyURL)
+		if proxyErr != nil {
+			logger.Error("代理地址无效", "error", proxyErr)
+			os.Exit(1)
+		}
+		wsDialer.Proxy = http.ProxyURL(proxyURL)
+	}
 	driver := hatch.NewDriver(hatch.DriverConfig{
 		SiteURL:       site,
+		WSDialer:      wsDialer,
 		MediaDir:      cfg.MediaDir(),
 		PublicBase:    cfg.PublicBase,
 		ChatTimeout:   cfg.ChatTimeout,
 		ImageTimeout:  cfg.ImageTimeout,
 		VideoTimeout:  cfg.VideoTimeout,
 		MaxMediaBytes: cfg.MaxMediaBytes,
+		HTTPClient:    httpClient,
 	}, store)
 	generationProtocol := "hatch-noise-protocol"
 	app := server.New(cfg, store, driver, logger)
@@ -90,4 +108,27 @@ func main() {
 	if ctx.Err() != nil {
 		<-shutdownDone
 	}
+}
+
+// upstreamHTTPClient applies MUSE2API_PROXY to every upstream HTTP call
+// (bootstrap, session checks, media fallback and quota discovery). Before this
+// helper the option was parsed and validated but never used.
+func upstreamHTTPClient(cfg config.Config) (*http.Client, error) {
+	transport, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return &http.Client{Timeout: 30 * time.Second}, nil
+	}
+	cloned := transport.Clone()
+	if cfg.ProxyURL != "" {
+		proxyURL, err := url.Parse(cfg.ProxyURL)
+		if err != nil {
+			return nil, err
+		}
+		cloned.Proxy = http.ProxyURL(proxyURL)
+	}
+	timeout := cfg.HTTPTimeout
+	if timeout < 30*time.Second {
+		timeout = 30 * time.Second
+	}
+	return &http.Client{Transport: cloned, Timeout: timeout}, nil
 }

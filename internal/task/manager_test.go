@@ -13,8 +13,18 @@ import (
 	"muse2api/internal/storage"
 )
 
+func openTestStore(t *testing.T) *storage.Store {
+	t.Helper()
+	s, err := storage.Open(t.TempDir(), []byte("01234567890123456789012345678901"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	return s
+}
+
 func TestManagerLifecycleAndQueue(t *testing.T) {
-	s, _ := storage.Open(t.TempDir(), []byte("01234567890123456789012345678901"), false)
+	s := openTestStore(t)
 	release := make(chan struct{})
 	m := NewManager(s, ProcessorFunc(func(ctx context.Context, t model.Task) (Result, error) {
 		select {
@@ -50,7 +60,7 @@ func TestManagerLifecycleAndQueue(t *testing.T) {
 	t.Fatal("tasks did not complete")
 }
 func TestCancelRunning(t *testing.T) {
-	s, _ := storage.Open(t.TempDir(), []byte("01234567890123456789012345678901"), false)
+	s := openTestStore(t)
 	started := make(chan struct{})
 	m := NewManager(s, ProcessorFunc(func(ctx context.Context, t model.Task) (Result, error) {
 		close(started)
@@ -77,7 +87,7 @@ func TestCancelRunning(t *testing.T) {
 }
 
 func TestManagerProcessesDuplicateEnqueueOnce(t *testing.T) {
-	s, _ := storage.Open(t.TempDir(), []byte("01234567890123456789012345678901"), false)
+	s := openTestStore(t)
 	var calls atomic.Int32
 	started := make(chan struct{}, 1)
 	release := make(chan struct{})
@@ -120,8 +130,8 @@ func TestManagerProcessesDuplicateEnqueueOnce(t *testing.T) {
 	t.Fatal("task did not complete")
 }
 
-func TestShutdownLeavesInterruptedTaskUnknown(t *testing.T) {
-	s, _ := storage.Open(t.TempDir(), []byte("01234567890123456789012345678901"), false)
+func TestShutdownPreservesUnassignedTask(t *testing.T) {
+	s := openTestStore(t)
 	started := make(chan struct{})
 	m := NewManager(s, ProcessorFunc(func(ctx context.Context, _ model.Task) (Result, error) {
 		close(started)
@@ -143,11 +153,42 @@ func TestShutdownLeavesInterruptedTaskUnknown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Status != model.TaskUnknown || !strings.Contains(got.Error, "服务关闭") {
+	if got.Status != model.TaskQueued || !strings.Contains(got.Error, "尚未分配账号") {
 		t.Fatalf("shutdown task state = %s %q", got.Status, got.Error)
 	}
 	if err := m.Enqueue("after-close"); !errors.Is(err, ErrClosed) {
 		t.Fatalf("enqueue after close = %v", err)
+	}
+}
+
+func TestShutdownLeavesAssignedTaskUnknown(t *testing.T) {
+	s := openTestStore(t)
+	started := make(chan struct{})
+	m := NewManager(s, ProcessorFunc(func(ctx context.Context, _ model.Task) (Result, error) {
+		close(started)
+		<-ctx.Done()
+		return Result{}, ctx.Err()
+	}), 1, 1)
+	defer m.Close()
+	task, _ := s.CreateTask("video", "v", "v", "", "")
+	if _, err := s.UpdateTask(task.ID, func(t *model.Task) error { t.AccountID = "account-1"; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Enqueue(task.ID); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := m.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetTask(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != model.TaskUnknown || !strings.Contains(got.Error, "服务关闭") {
+		t.Fatalf("assigned shutdown task state = %s %q", got.Status, got.Error)
 	}
 }
 

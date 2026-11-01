@@ -72,7 +72,7 @@ export default function Tasks({ initialSearch = '', initialStatus = '', initialK
   const refreshError = Boolean(error && data)
   const single = Boolean(loadError || isLoading || tasks.length === 0)
   const mutation = useMutation({
-    mutationFn: ({ task, action }: { task: Task; action: 'cancel' | 'delete' }) => api(`/admin/tasks/${task.id}${action === 'cancel' ? '/cancel' : ''}`, { method: action === 'cancel' ? 'POST' : 'DELETE' }),
+    mutationFn: ({ task, action }: { task: Task; action: 'cancel' | 'delete' | 'retry' }) => api(`/admin/tasks/${task.id}${action === 'cancel' ? '/cancel' : action === 'retry' ? '/retry' : ''}`, { method: action === 'delete' ? 'DELETE' : 'POST', body: action === 'retry' ? JSON.stringify({}) : undefined }),
     onSuccess: (_, variables) => {
       client.invalidateQueries({ queryKey: ['tasks'] })
       client.invalidateQueries({ queryKey: ['overview'] })
@@ -121,7 +121,7 @@ export default function Tasks({ initialSearch = '', initialStatus = '', initialK
       {tasks.length > 0 && !loadError && <>
         {isMobile && active && <button className="detail-scrim" aria-label="关闭任务详情" onClick={() => setSelectedId(undefined)} />}
         <section className={`inspector-pane task-detail ${active ? 'open' : ''}`} aria-label="任务详情">
-          {active ? <TaskInspector task={active} isMobile={isMobile} onClose={() => setSelectedId(undefined)} onCancel={setCancel} onRemove={setRemove} onOpenResult={openResult} /> : <div className="task-detail-empty"><span className="state-icon"><ListChecks size={20} /></span><h3>选择一条任务</h3><p>查看完整提示词、账号、耗时和生成结果。列表会随任务进度自动更新。</p></div>}
+          {active ? <TaskInspector task={active} isMobile={isMobile} onClose={() => setSelectedId(undefined)} onCancel={setCancel} onRemove={setRemove} onRetry={task => mutation.mutate({ task, action: 'retry' })} onOpenResult={openResult} /> : <div className="task-detail-empty"><span className="state-icon"><ListChecks size={20} /></span><h3>选择一条任务</h3><p>查看完整提示词、账号、耗时和生成结果。列表会随任务进度自动更新。</p></div>}
         </section>
       </>}
     </section>
@@ -131,7 +131,7 @@ export default function Tasks({ initialSearch = '', initialStatus = '', initialK
   </div>
 }
 
-function TaskInspector({ task, isMobile, onClose, onCancel, onRemove, onOpenResult }: { task: Task; isMobile: boolean; onClose: () => void; onCancel: (task: Task) => void; onRemove: (task: Task) => void; onOpenResult: (task: Task) => void }) {
+function TaskInspector({ task, isMobile, onClose, onCancel, onRemove, onRetry, onOpenResult }: { task: Task; isMobile: boolean; onClose: () => void; onCancel: (task: Task) => void; onRemove: (task: Task) => void; onRetry: (task: Task) => void; onOpenResult: (task: Task) => void }) {
   const steps = [
     { label: '提交', time: task.created_at },
     { label: '开始', time: task.started_at },
@@ -185,7 +185,10 @@ function TaskInspector({ task, isMobile, onClose, onCancel, onRemove, onOpenResu
     <div className="inspector-foot">
       {ACTIVE.includes(task.status)
         ? (task.kind !== 'chat' ? <Button variant="secondary" size="sm" onClick={() => onCancel(task)}><Ban size={13} />取消任务</Button> : <span className="secondary-cell">对话任务随请求结束</span>)
-        : <Button variant="danger" size="sm" onClick={() => onRemove(task)}><Trash2 size={13} />删除记录</Button>}
+        : <>
+            {['failed', 'cancelled'].includes(task.status) && <Button variant="secondary" size="sm" onClick={() => onRetry(task)}><RefreshCw size={13} />重新排队</Button>}
+            <Button variant="danger" size="sm" onClick={() => onRemove(task)}><Trash2 size={13} />删除记录</Button>
+          </>}
       <span className="spacer" />
       <span className="secondary-cell"><Clock3 size={11} />{dateTime(task.updated_at)} 更新</span>
     </div>

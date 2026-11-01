@@ -1,9 +1,14 @@
 package refimage
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"errors"
+	"image"
+	"image/color"
+	"image/png"
+	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -88,5 +93,74 @@ func TestNormalizeAllLimits(t *testing.T) {
 	big := "data:image/png;base64," + chunk
 	if _, err := NormalizeAll(context.Background(), []string{big, big, big}, Policy{}); !errors.Is(err, ErrTotalTooLarge) {
 		t.Fatalf("aggregate limit not enforced: %v", err)
+	}
+}
+
+func randomReference(t *testing.T, width, height int, alpha bool) []byte {
+	t.Helper()
+	img := image.NewNRGBA(image.Rect(0, 0, width, height))
+	rng := rand.New(rand.NewSource(int64(width*height + 1)))
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			a := uint8(255)
+			if alpha {
+				a = uint8(rng.Intn(256))
+			}
+			img.SetNRGBA(x, y, color.NRGBA{R: uint8(rng.Intn(256)), G: uint8(rng.Intn(256)), B: uint8(rng.Intn(256)), A: a})
+		}
+	}
+	var encoded bytes.Buffer
+	if err := png.Encode(&encoded, img); err != nil {
+		t.Fatal(err)
+	}
+	return encoded.Bytes()
+}
+
+func TestNormalizeCompressesOversizedReference(t *testing.T) {
+	source := randomReference(t, 160, 160, false)
+	dataURL := "data:image/png;base64," + base64.StdEncoding.EncodeToString(source)
+	normalized, err := Normalize(context.Background(), dataURL, Policy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(normalized.DataURL()) > maxInlineDataURLBytes {
+		t.Fatalf("inline reference still %d bytes", len(normalized.DataURL()))
+	}
+	cfg, format, err := image.DecodeConfig(bytes.NewReader(normalized.Data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Width > 160 || cfg.Height > 160 || cfg.Width <= 0 || cfg.Height <= 0 {
+		t.Fatalf("unexpected dimensions %dx%d (format %s)", cfg.Width, cfg.Height, format)
+	}
+}
+
+func TestNormalizeKeepsTransparencyWhenCompressing(t *testing.T) {
+	source := randomReference(t, 160, 160, true)
+	dataURL := "data:image/png;base64," + base64.StdEncoding.EncodeToString(source)
+	normalized, err := Normalize(context.Background(), dataURL, Policy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if normalized.MIME != "image/png" {
+		t.Fatalf("transparent reference re-encoded as %s", normalized.MIME)
+	}
+	decoded, err := png.Decode(bytes.NewReader(normalized.Data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !imageHasAlpha(decoded) {
+		t.Fatal("alpha channel was lost during compression")
+	}
+	if len(normalized.DataURL()) > maxInlineDataURLBytes {
+		t.Fatalf("inline reference still %d bytes", len(normalized.DataURL()))
+	}
+}
+
+func TestNormalizeRejectsOversizedUndecodableReference(t *testing.T) {
+	invalid := bytes.Repeat([]byte{0x42}, 50_000)
+	dataURL := "data:image/png;base64," + base64.StdEncoding.EncodeToString(invalid)
+	if _, err := Normalize(context.Background(), dataURL, Policy{}); !errors.Is(err, ErrInlineTooLarge) {
+		t.Fatalf("oversized undecodable reference accepted: %v", err)
 	}
 }

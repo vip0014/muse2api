@@ -44,6 +44,10 @@ var (
 // the same HTTP session (cookies) as the gateway bootstrap, but never wakes or
 // contacts the VM.
 func (c *Client) QueryQuota(ctx context.Context, creds protocol.AccountCredentials) (*model.Quota, error) {
+	// A cold action-id cache can trigger a multi-chunk scan. Serialize it per
+	// account instead of launching the same scan from auto-check and admin.
+	c.quotaFlight.Lock()
+	defer c.quotaFlight.Unlock()
 	if c.site == nil {
 		return nil, errors.New("额度查询缺少上游地址")
 	}

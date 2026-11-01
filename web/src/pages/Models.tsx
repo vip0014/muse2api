@@ -8,6 +8,7 @@ import { Badge, Button, Empty, ErrorState, Loading, PageHeader, RefreshError } f
 const statusMeta: Record<string, { label: string; tone: 'success' | 'warning' | 'neutral' }> = {
   VERIFIED: { label: '已验证', tone: 'success' },
   IMPLEMENTED: { label: '已实现', tone: 'success' },
+  PARTIAL: { label: '部分实现', tone: 'warning' },
   UNAVAILABLE: { label: '不可用', tone: 'warning' },
   UNVERIFIED: { label: '未验证', tone: 'neutral' },
 }

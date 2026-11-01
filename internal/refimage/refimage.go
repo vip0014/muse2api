@@ -60,16 +60,27 @@ func (n Normalized) DataURL() string {
 // Normalize validates one reference. It accepts data URLs, bare base64,
 // http(s) URLs, and (only when enabled) local file paths.
 func Normalize(ctx context.Context, raw string, policy Policy) (Normalized, error) {
+	normalized, err := normalizeRaw(ctx, raw, policy)
+	if err != nil {
+		return Normalized{}, err
+	}
+	return fitInline(normalized)
+}
+
+// normalizeRaw validates size, MIME, and source policy without recompressing.
+// NormalizeAll uses it to enforce the aggregate budget before spending CPU on
+// inline fitting.
+func normalizeRaw(ctx context.Context, raw string, policy Policy) (Normalized, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return Normalized{}, fmt.Errorf("%w: 内容为空", ErrInvalidReference)
 	}
 	if strings.HasPrefix(raw, "data:") {
-		data, mimeType, err := DecodeDataURL(raw)
+		normalized, err := decodeDataURLRaw(raw)
 		if err != nil {
 			return Normalized{}, err
 		}
-		return checked(data, mimeType)
+		return normalized, nil
 	}
 	if strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://") {
 		data, mimeType, err := fetchHTTP(ctx, raw, policy)
@@ -98,10 +109,10 @@ func NormalizeAll(ctx context.Context, raws []string, policy Policy) ([]string, 
 	if len(raws) > MaxImages {
 		return nil, ErrTooManyImages
 	}
-	out := make([]string, 0, len(raws))
+	normalizedRefs := make([]Normalized, 0, len(raws))
 	total := 0
 	for index, raw := range raws {
-		normalized, err := Normalize(ctx, raw, policy)
+		normalized, err := normalizeRaw(ctx, raw, policy)
 		if err != nil {
 			return nil, fmt.Errorf("第 %d 张参考图：%w", index+1, err)
 		}
@@ -109,17 +120,38 @@ func NormalizeAll(ctx context.Context, raws []string, policy Policy) ([]string, 
 		if total > MaxTotalBytes {
 			return nil, ErrTotalTooLarge
 		}
-		out = append(out, normalized.DataURL())
+		normalizedRefs = append(normalizedRefs, normalized)
+	}
+	out := make([]string, 0, len(normalizedRefs))
+	for index, normalized := range normalizedRefs {
+		fitted, err := fitInline(normalized)
+		if err != nil {
+			return nil, fmt.Errorf("第 %d 张参考图：%w", index+1, err)
+		}
+		out = append(out, fitted.DataURL())
 	}
 	return out, nil
 }
 
 // DecodeDataURL decodes a data URL produced by Normalize (or supplied by the
-// caller) and validates its embedded MIME and size.
+// caller), validates its embedded MIME and size, and applies the same inline
+// attachment budget as Normalize.
 func DecodeDataURL(raw string) ([]byte, string, error) {
+	normalized, err := decodeDataURLRaw(raw)
+	if err != nil {
+		return nil, "", err
+	}
+	fitted, err := fitInline(normalized)
+	if err != nil {
+		return nil, "", err
+	}
+	return fitted.Data, fitted.MIME, nil
+}
+
+func decodeDataURLRaw(raw string) (Normalized, error) {
 	head, payload, ok := strings.Cut(raw, ",")
 	if !ok || !strings.HasPrefix(strings.ToLower(head), "data:") {
-		return nil, "", fmt.Errorf("%w: Data URL 格式无效", ErrInvalidReference)
+		return Normalized{}, fmt.Errorf("%w: Data URL 格式无效", ErrInvalidReference)
 	}
 	meta := head[len("data:"):]
 	parts := strings.Split(meta, ";")
@@ -144,13 +176,9 @@ func DecodeDataURL(raw string) ([]byte, string, error) {
 		data = []byte(decoded)
 	}
 	if err != nil {
-		return nil, "", fmt.Errorf("%w: Data URL 编码无效", ErrInvalidReference)
+		return Normalized{}, fmt.Errorf("%w: Data URL 编码无效", ErrInvalidReference)
 	}
-	normalized, err := checked(data, mimeType)
-	if err != nil {
-		return nil, "", err
-	}
-	return normalized.Data, normalized.MIME, nil
+	return checked(data, mimeType)
 }
 
 func checked(data []byte, mimeType string) (Normalized, error) {
@@ -341,4 +369,24 @@ func isPublicIP(ip net.IP) bool {
 		}
 	}
 	return true
+}
+
+// NewPublicHTTPClient returns a client that refuses private/loopback targets
+// and unsafe redirects. Media URLs supplied by upstream history are untrusted
+// input, so they use the same policy as reference images.
+func NewPublicHTTPClient(timeout time.Duration) *http.Client {
+	transport := &http.Transport{Proxy: nil, DialContext: publicDialContext}
+	return &http.Client{
+		Transport: transport,
+		Timeout:   timeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= maxRedirects {
+				return fmt.Errorf("%w: 重定向次数过多", ErrInvalidReference)
+			}
+			if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
+				return fmt.Errorf("%w: 重定向到不支持的协议", ErrInvalidReference)
+			}
+			return nil
+		},
+	}
 }

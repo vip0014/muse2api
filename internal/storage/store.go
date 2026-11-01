@@ -1,19 +1,19 @@
 package storage
 
 import (
-	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	_ "modernc.org/sqlite"
 
 	"muse2api/internal/model"
 )
@@ -21,12 +21,15 @@ import (
 var ErrNotFound = errors.New("not found")
 var ErrConflict = errors.New("conflict")
 
+// diskAccounts is the legacy JSON envelope. It is kept only for one-way
+// migration; new state lives in SQLite.
 type diskAccounts struct {
 	Version   int             `json:"version"`
 	Encrypted bool            `json:"encrypted"`
 	Payload   string          `json:"payload,omitempty"`
 	Accounts  []model.Account `json:"accounts,omitempty"`
 }
+
 type diskCredentials struct {
 	Cookies      map[string]string `json:"cookies"`
 	CookieExpiry map[string]int64  `json:"cookies_exp"`
@@ -37,21 +40,23 @@ type diskAPIKey struct {
 	Payload string `json:"payload"`
 }
 
-type Store struct {
-	mu         sync.RWMutex
-	dir        string
-	box        *sealBox
-	insecure   bool
-	keepLegacy bool
-	accounts   map[string]model.Account
-	tasks      map[string]model.Task
-	events     []model.Event
-}
-
 type Options struct {
 	CredentialKey       []byte
 	AllowInsecure       bool
 	KeepLegacyPlaintext bool
+}
+
+// Store is a SQLite-backed repository. One connection is used intentionally:
+// SQLite serializes writes, and the upstream gateway is the real concurrency
+// bottleneck. The schema has indexes for the paths that matter (idempotency,
+// queue ordering, task history).
+type Store struct {
+	mu         sync.Mutex
+	dir        string
+	db         *sql.DB
+	box        *sealBox
+	insecure   bool
+	keepLegacy bool
 }
 
 func Open(dir string, key []byte, allowInsecure bool) (*Store, error) {
@@ -65,89 +70,293 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 	if err := os.MkdirAll(filepath.Join(dir, "backups"), 0o700); err != nil {
 		return nil, err
 	}
-	s := &Store{dir: dir, insecure: opts.AllowInsecure, keepLegacy: opts.KeepLegacyPlaintext, accounts: map[string]model.Account{}, tasks: map[string]model.Task{}}
+	var box *sealBox
 	if len(opts.CredentialKey) > 0 {
-		box, err := newSealBox(opts.CredentialKey)
+		var err error
+		box, err = newSealBox(opts.CredentialKey)
 		if err != nil {
 			return nil, err
 		}
-		s.box = box
 	}
-	securePath := filepath.Join(dir, "accounts.secure.json")
-	if _, err := os.Stat(securePath); err == nil {
-		if err := s.loadAccounts(securePath); err != nil {
-			return nil, err
-		}
-	} else if !os.IsNotExist(err) {
-		return nil, err
-	} else if err := s.migrateLegacyAccounts(); err != nil {
+	if err := applyStagedRestore(dir); err != nil {
 		return nil, err
 	}
-	if err := readJSON(filepath.Join(dir, "tasks.json"), &s.tasks); err != nil {
-		return nil, fmt.Errorf("读取任务数据: %w", err)
-	}
-	if s.tasks == nil {
-		s.tasks = map[string]model.Task{}
-	}
-	if err := readJSON(filepath.Join(dir, "events.json"), &s.events); err != nil {
+	dbPath := filepath.Join(dir, "muse2api.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
 		return nil, err
 	}
-	for id, task := range s.tasks {
-		normalizeTask(&task)
-		if task.Status == model.TaskQueued || task.Status == model.TaskRunning {
-			task.Status = model.TaskUnknown
-			task.Error = "服务重启后无法确认上游结果，未自动重试"
-			task.UpdatedAt = time.Now().Unix()
-		}
-		s.tasks[id] = task
+	_ = os.Chmod(dbPath, 0o600)
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(0)
+	s := &Store{dir: dir, db: db, box: box, insecure: opts.AllowInsecure, keepLegacy: opts.KeepLegacyPlaintext}
+	if err := s.configure(); err != nil {
+		_ = db.Close()
+		return nil, err
 	}
+	if err := s.initSchema(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := s.migrateLegacy(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := s.reconcileTasks(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	// SQLite creates the database lazily during the first PRAGMA/schema write.
+	// Tighten it (and existing WAL sidecars) after the file exists.
+	_ = os.Chmod(dbPath, 0o600)
+	_ = os.Chmod(dbPath+"-wal", 0o600)
+	_ = os.Chmod(dbPath+"-shm", 0o600)
 	return s, nil
 }
 
-func (s *Store) migrateLegacyAccounts() error {
-	path := filepath.Join(s.dir, "accounts.json")
-	var legacy []model.Account
-	if err := readJSON(path, &legacy); err != nil {
-		return fmt.Errorf("迁移旧账号: %w", err)
+func (s *Store) configure() error {
+	stmts := []string{
+		`PRAGMA busy_timeout = 5000`,
+		`PRAGMA foreign_keys = ON`,
+		`PRAGMA synchronous = FULL`,
 	}
-	if len(legacy) == 0 {
-		return nil
+	for _, stmt := range stmts {
+		if _, err := s.db.Exec(stmt); err != nil {
+			return err
+		}
 	}
-	if s.box == nil && !s.insecure {
-		return errors.New("检测到旧版明文账号：请设置 MUSE2API_CREDENTIAL_KEY 后迁移；原文件未被修改")
+	var mode string
+	if err := s.db.QueryRow(`PRAGMA journal_mode = WAL`).Scan(&mode); err != nil {
+		return err
 	}
-	backupPath, err := backup(path)
+	return nil
+}
+
+func (s *Store) initSchema() error {
+	_, err := s.db.Exec(`
+CREATE TABLE IF NOT EXISTS meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS accounts (
+  id TEXT PRIMARY KEY,
+  label TEXT NOT NULL,
+  status TEXT NOT NULL,
+  enabled INTEGER NOT NULL,
+  essential_ok INTEGER NOT NULL,
+  cookie_count INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  last_used INTEGER NOT NULL DEFAULT 0,
+  last_checked INTEGER NOT NULL DEFAULT 0,
+  last_keepalive INTEGER NOT NULL DEFAULT 0,
+  use_count INTEGER NOT NULL DEFAULT 0,
+  expires_at INTEGER NOT NULL DEFAULT 0,
+  expiry_estimated INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT NOT NULL DEFAULT '',
+  note TEXT NOT NULL DEFAULT '',
+  max_concurrency INTEGER NOT NULL DEFAULT 1,
+  failure_count INTEGER NOT NULL DEFAULT 0,
+  cooldown_until INTEGER NOT NULL DEFAULT 0,
+  credentials_version INTEGER NOT NULL DEFAULT 0,
+  quota_json TEXT NOT NULL DEFAULT '',
+  ok INTEGER,
+  synced_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS account_credentials (
+  account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+  payload TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tasks (
+  id TEXT PRIMARY KEY,
+  object TEXT NOT NULL DEFAULT '',
+  kind TEXT NOT NULL,
+  prompt TEXT NOT NULL,
+  api_prompt TEXT NOT NULL,
+  status TEXT NOT NULL,
+  progress INTEGER NOT NULL DEFAULT 0,
+  account_id TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  started_at INTEGER NOT NULL DEFAULT 0,
+  completed_at INTEGER NOT NULL DEFAULT 0,
+  elapsed REAL NOT NULL DEFAULT 0,
+  error TEXT NOT NULL DEFAULT '',
+  result_json TEXT NOT NULL DEFAULT '',
+  url TEXT NOT NULL DEFAULT '',
+  size TEXT NOT NULL DEFAULT '',
+  model TEXT NOT NULL DEFAULT '',
+  aspect_ratio TEXT NOT NULL DEFAULT '',
+  resolution TEXT NOT NULL DEFAULT '',
+  duration INTEGER NOT NULL DEFAULT 0,
+  response_format TEXT NOT NULL DEFAULT '',
+  idempotency_key TEXT NOT NULL DEFAULT '',
+  request_hash TEXT NOT NULL DEFAULT '',
+  cancel_requested INTEGER NOT NULL DEFAULT 0,
+  reference_image TEXT NOT NULL DEFAULT '',
+  reference_images_json TEXT NOT NULL DEFAULT ''
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_idempotency
+  ON tasks(kind, idempotency_key) WHERE idempotency_key <> '';
+CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status, created_at);
+CREATE TABLE IF NOT EXISTS events (
+  id TEXT PRIMARY KEY,
+  time_ns INTEGER NOT NULL,
+  level TEXT NOT NULL,
+  type TEXT NOT NULL,
+  message TEXT NOT NULL,
+  request_id TEXT NOT NULL DEFAULT '',
+  task_id TEXT NOT NULL DEFAULT '',
+  account_id TEXT NOT NULL DEFAULT '',
+  upstream_status INTEGER NOT NULL DEFAULT 0,
+  duration_ms INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_events_time ON events(time_ns DESC);
+CREATE TABLE IF NOT EXISTS api_key (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  payload TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS media (
+  name TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL DEFAULT '',
+  kind TEXT NOT NULL DEFAULT '',
+  mime TEXT NOT NULL DEFAULT '',
+  bytes INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_media_created ON media(created_at DESC);
+`)
 	if err != nil {
 		return err
 	}
-	for _, a := range legacy {
-		if a.ID == "" {
-			a.ID = randomID(6)
-		}
-		normalizeAccount(&a)
-		s.accounts[a.ID] = a
+	// Add columns introduced after the first SQLite schema version. SQLite
+	// has no IF NOT EXISTS for ADD COLUMN, so inspect the table first.
+	accountColumns := []struct{ name, ddl string }{
+		{"failure_count", `ALTER TABLE accounts ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0`},
+		{"cooldown_until", `ALTER TABLE accounts ADD COLUMN cooldown_until INTEGER NOT NULL DEFAULT 0`},
+		{"credentials_version", `ALTER TABLE accounts ADD COLUMN credentials_version INTEGER NOT NULL DEFAULT 0`},
 	}
-	if err := s.saveAccountsLocked(); err != nil {
-		return err
-	}
-	if s.box != nil && !s.keepLegacy {
-		if err := sanitizeLegacyAccounts(path); err != nil {
-			_ = s.appendEventLocked(model.Event{Level: "error", Type: "migration.sanitize", Message: "旧版明文账号文件脱敏失败，请手动删除: " + err.Error()})
+	for _, column := range accountColumns {
+		var count int
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('accounts') WHERE name = ?`, column.name).Scan(&count); err != nil {
+			return err
 		}
-		if backupPath != "" {
-			if err := sanitizeLegacyAccounts(backupPath); err != nil {
-				_ = s.appendEventLocked(model.Event{Level: "error", Type: "migration.sanitize", Message: "旧版明文迁移备份脱敏失败，请手动删除: " + err.Error()})
+		if count == 0 {
+			if _, err := s.db.Exec(column.ddl); err != nil {
+				return err
 			}
 		}
-		return s.appendEventLocked(model.Event{Level: "info", Type: "migration", Message: fmt.Sprintf("已加密迁移 %d 个旧版账号并脱敏旧明文文件；回滚请使用升级前备份", len(legacy))})
 	}
-	return s.appendEventLocked(model.Event{Level: "info", Type: "migration", Message: fmt.Sprintf("已备份并迁移 %d 个旧版账号；原文件保留", len(legacy))})
+	for _, column := range []struct{ name, ddl string }{
+		{"reference_image", `ALTER TABLE tasks ADD COLUMN reference_image TEXT NOT NULL DEFAULT ''`},
+		{"reference_images_json", `ALTER TABLE tasks ADD COLUMN reference_images_json TEXT NOT NULL DEFAULT ''`},
+	} {
+		var count int
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = ?`, column.name).Scan(&count); err != nil {
+			return err
+		}
+		if count == 0 {
+			if _, err := s.db.Exec(column.ddl); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
-func (s *Store) loadAccounts(path string) error {
+func (s *Store) Close() error {
+	if s.db == nil {
+		return nil
+	}
+	return s.db.Close()
+}
+
+// ---------------------------------------------------------------------------
+// legacy migration
+// ---------------------------------------------------------------------------
+
+func (s *Store) migrateLegacy() error {
+	var marker string
+	_ = s.db.QueryRow(`SELECT value FROM meta WHERE key = 'legacy_imported'`).Scan(&marker)
+	if marker == "1" {
+		return nil
+	}
+	var accountCount int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM accounts`).Scan(&accountCount); err != nil {
+		return err
+	}
+	if accountCount > 0 {
+		return s.setMeta("legacy_imported", "1")
+	}
+
+	accountsPath := filepath.Join(s.dir, "accounts.secure.json")
+	legacyPath := filepath.Join(s.dir, "accounts.json")
+	tasksPath := filepath.Join(s.dir, "tasks.json")
+	eventsPath := filepath.Join(s.dir, "events.json")
+	apiKeyPath := filepath.Join(s.dir, "api_key.secure")
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var legacyBackup string
+	if _, err := os.Stat(accountsPath); err == nil {
+		if err := s.importSecureAccounts(tx, accountsPath); err != nil {
+			return err
+		}
+	} else if _, err := os.Stat(legacyPath); err == nil {
+		legacyBackup, err = s.importLegacyAccounts(tx, legacyPath)
+		if err != nil {
+			return err
+		}
+	}
+	if _, err := os.Stat(tasksPath); err == nil {
+		if err := s.importLegacyTasks(tx, tasksPath); err != nil {
+			return err
+		}
+	}
+	if _, err := os.Stat(eventsPath); err == nil {
+		if err := s.importLegacyEvents(tx, eventsPath); err != nil {
+			return err
+		}
+	}
+	if _, err := os.Stat(apiKeyPath); err == nil {
+		var disk diskAPIKey
+		if err := readJSON(apiKeyPath, &disk); err != nil {
+			return err
+		}
+		if disk.Payload != "" {
+			if _, err := tx.Exec(`INSERT OR REPLACE INTO api_key(id, payload, updated_at) VALUES (1, ?, ?)`, disk.Payload, time.Now().Unix()); err != nil {
+				return err
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	// Only redact legacy plaintext after the whole import commits. Doing it
+	// inside the transaction could destroy the only copy if a later task/event
+	// import failed and rolled back.
+	if legacyBackup != "" && s.box != nil && !s.keepLegacy {
+		if err := sanitizeLegacyAccounts(legacyPath); err != nil {
+			return err
+		}
+		if err := sanitizeLegacyAccounts(legacyBackup); err != nil {
+			return err
+		}
+	}
+	return s.setMeta("legacy_imported", "1")
+}
+
+func (s *Store) importSecureAccounts(tx *sql.Tx, path string) error {
 	var disk diskAccounts
 	if err := readJSON(path, &disk); err != nil {
-		return err
+		return fmt.Errorf("迁移账号数据: %w", err)
 	}
 	if disk.Encrypted {
 		if s.box == nil {
@@ -165,7 +374,9 @@ func (s *Store) loadAccounts(path string) error {
 			c := credentials[a.ID]
 			a.Cookies, a.CookieExpiry = c.Cookies, c.CookieExpiry
 			normalizeAccount(&a)
-			s.accounts[a.ID] = a
+			if err := s.insertAccountTx(tx, a); err != nil {
+				return err
+			}
 		}
 		return nil
 	}
@@ -174,652 +385,112 @@ func (s *Store) loadAccounts(path string) error {
 	}
 	for _, a := range disk.Accounts {
 		normalizeAccount(&a)
-		s.accounts[a.ID] = a
+		if err := s.insertAccountTx(tx, a); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
-func (s *Store) saveAccountsLocked() error {
+func (s *Store) importLegacyAccounts(tx *sql.Tx, path string) (string, error) {
+	var legacy []model.Account
+	if err := readJSON(path, &legacy); err != nil {
+		return "", fmt.Errorf("迁移旧账号: %w", err)
+	}
+	if len(legacy) == 0 {
+		return "", nil
+	}
 	if s.box == nil && !s.insecure {
-		return errors.New("refusing to write plaintext credentials without explicit insecure mode")
+		return "", errors.New("检测到旧版明文账号：请设置 MUSE2API_CREDENTIAL_KEY 后迁移；原文件未被修改")
 	}
-	disk := diskAccounts{Version: 1, Encrypted: s.box != nil}
-	credentials := map[string]diskCredentials{}
-	for id, a := range s.accounts {
-		if s.box == nil {
-			// Insecure development mode deliberately persists plaintext credentials.
-			disk.Accounts = append(disk.Accounts, a)
-			continue
-		}
-		public := a
-		public.Cookies, public.CookieExpiry = nil, nil
-		disk.Accounts = append(disk.Accounts, public)
-		credentials[id] = diskCredentials{a.Cookies, a.CookieExpiry}
+	backupPath, err := backupFile(path)
+	if err != nil {
+		return "", err
 	}
-	sort.Slice(disk.Accounts, func(i, j int) bool { return disk.Accounts[i].CreatedAt < disk.Accounts[j].CreatedAt })
-	if s.box != nil {
-		plaintext, err := json.Marshal(credentials)
-		if err != nil {
-			return err
+	for _, a := range legacy {
+		if a.ID == "" {
+			a.ID = randomID(6)
 		}
-		payload, err := s.box.Seal(plaintext)
-		if err != nil {
-			return err
+		normalizeAccount(&a)
+		if err := s.insertAccountTx(tx, a); err != nil {
+			return "", err
 		}
-		disk.Payload = payload
 	}
-	return writeJSON(filepath.Join(s.dir, "accounts.secure.json"), disk)
+	return backupPath, nil
 }
 
-func (s *Store) ListAccounts() []model.Account {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make([]model.Account, 0, len(s.accounts))
-	for _, a := range s.accounts {
-		a = cloneAccount(a)
-		a.Cookies, a.CookieExpiry = nil, nil
-		out = append(out, a)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt > out[j].CreatedAt })
-	return out
-}
-func (s *Store) GetAccount(id string) (model.Account, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	a, ok := s.accounts[id]
-	if !ok {
-		return model.Account{}, ErrNotFound
-	}
-	return cloneAccount(a), nil
-}
-func (s *Store) AddAccount(label string, cookies map[string]string, expires map[string]int64) (model.Account, error) {
-	if len(cookies) == 0 {
-		return model.Account{}, errors.New("cookies required")
-	}
-	now := time.Now().Unix()
-	a := model.Account{ID: randomID(6), Label: label, Cookies: cloneStrings(cookies), CookieExpiry: cloneInt64s(expires), Enabled: true, CreatedAt: now, MaxConcurrency: 1, Status: model.AccountUnknown}
-	if a.Label == "" {
-		a.Label = a.ID
-	}
-	normalizeAccount(&a)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.accounts[a.ID] = a
-	if err := s.saveAccountsLocked(); err != nil {
-		delete(s.accounts, a.ID)
-		return model.Account{}, err
-	}
-	if err := s.appendEventLocked(model.Event{Level: "info", Type: "account.import", Message: "账号凭据已导入", AccountID: a.ID}); err != nil {
-		return model.Account{}, err
-	}
-	return sanitizeAccount(a), nil
-}
-func (s *Store) UpdateAccount(id string, mutate func(*model.Account) error) (model.Account, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	old, ok := s.accounts[id]
-	if !ok {
-		return model.Account{}, ErrNotFound
-	}
-	a := cloneAccount(old)
-	if err := mutate(&a); err != nil {
-		return model.Account{}, err
-	}
-	normalizeAccount(&a)
-	s.accounts[id] = a
-	if err := s.saveAccountsLocked(); err != nil {
-		s.accounts[id] = old
-		return model.Account{}, err
-	}
-	return sanitizeAccount(a), nil
-}
-func (s *Store) DeleteAccount(id string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	old, ok := s.accounts[id]
-	if !ok {
-		return ErrNotFound
-	}
-	delete(s.accounts, id)
-	if err := s.saveAccountsLocked(); err != nil {
-		s.accounts[id] = old
+func (s *Store) importLegacyTasks(tx *sql.Tx, path string) error {
+	var tasks map[string]model.Task
+	if err := readJSON(path, &tasks); err != nil {
 		return err
 	}
-	return s.appendEventLocked(model.Event{Level: "info", Type: "account.delete", Message: "账号已删除", AccountID: id})
-}
-func (s *Store) AccountStats() map[string]int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := map[string]int{"total": len(s.accounts)}
-	now := time.Now().Unix()
-	for _, a := range s.accounts {
-		if a.Enabled {
-			out["enabled"]++
-		} else {
-			out["disabled"]++
+	for id, task := range tasks {
+		if task.ID == "" {
+			task.ID = id
 		}
-		if a.Status == model.AccountActive {
-			out["healthy"]++
-			out["active"]++
+		if err := insertTaskTx(tx, task); err != nil {
+			return err
 		}
-		if a.Status == model.AccountExpired || a.Status == model.AccountError {
-			out["error"]++
-		}
-		if a.ExpiresAt > 0 && a.ExpiresAt <= now {
-			out["expired"]++
-		} else if a.ExpiresAt > 0 && a.ExpiresAt-now < 3*86400 {
-			out["expiring"]++
-		}
-	}
-	return out
-}
-
-func (s *Store) CreateTask(kind, prompt, apiPrompt, key, hash string) (model.Task, error) {
-	t, _, err := s.FindOrCreateTask(model.Task{Kind: kind, Prompt: prompt, APIPrompt: apiPrompt, IdempotencyKey: key, RequestHash: hash})
-	return t, err
-}
-
-// FindOrCreateTask makes idempotency check + insert one atomic operation.
-func (s *Store) FindOrCreateTask(t model.Task) (model.Task, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if t.IdempotencyKey != "" {
-		for _, existing := range s.tasks {
-			// Idempotency is scoped by task kind: the same client header may
-			// legitimately appear on an image and a video request.
-			if existing.Kind == t.Kind && existing.IdempotencyKey == t.IdempotencyKey {
-				if existing.RequestHash != t.RequestHash {
-					return model.Task{}, false, ErrConflict
-				}
-				return cloneTask(existing), false, nil
-			}
-		}
-	}
-	now := time.Now().Unix()
-	if t.ID == "" {
-		t.ID = "task_" + randomID(10)
-	}
-	t.Object = "task"
-	t.Status = model.TaskQueued
-	t.CreatedAt = now
-	t.UpdatedAt = now
-	s.tasks[t.ID] = t
-	if err := s.saveTasksLocked(); err != nil {
-		delete(s.tasks, t.ID)
-		return model.Task{}, false, err
-	}
-	return cloneTask(t), true, nil
-}
-func (s *Store) UpdateTask(id string, mutate func(*model.Task) error) (model.Task, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	old, ok := s.tasks[id]
-	if !ok {
-		return model.Task{}, ErrNotFound
-	}
-	t := cloneTask(old)
-	if err := mutate(&t); err != nil {
-		return model.Task{}, err
-	}
-	if !model.ValidTaskTransition(old.Status, t.Status) {
-		return model.Task{}, fmt.Errorf("%w: invalid task transition %s -> %s", ErrConflict, old.Status, t.Status)
-	}
-	t.UpdatedAt = time.Now().Unix()
-	s.tasks[id] = t
-	if err := s.saveTasksLocked(); err != nil {
-		s.tasks[id] = old
-		return model.Task{}, err
-	}
-	return cloneTask(t), nil
-}
-func (s *Store) GetTask(id string) (model.Task, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	t, ok := s.tasks[id]
-	if !ok {
-		return model.Task{}, ErrNotFound
-	}
-	return cloneTask(t), nil
-}
-
-// ClaimTask atomically moves a queued task to running. Two workers that
-// receive the same ID (duplicate enqueue, retry, or operator action) cannot
-// both claim it, preventing duplicate upstream generation.
-func (s *Store) ClaimTask(id string) (model.Task, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	old, ok := s.tasks[id]
-	if !ok {
-		return model.Task{}, ErrNotFound
-	}
-	if old.Status != model.TaskQueued {
-		return model.Task{}, fmt.Errorf("%w: task %s is %s, not queued", ErrConflict, id, old.Status)
-	}
-	now := time.Now()
-	t := cloneTask(old)
-	t.Status = model.TaskRunning
-	t.StartedAt = now.Unix()
-	t.Progress = 5
-	t.UpdatedAt = now.Unix()
-	s.tasks[id] = t
-	if err := s.saveTasksLocked(); err != nil {
-		s.tasks[id] = old
-		return model.Task{}, err
-	}
-	return cloneTask(t), nil
-}
-func (s *Store) ListTasks(limit int) []model.Task {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make([]model.Task, 0, len(s.tasks))
-	for _, task := range s.tasks {
-		out = append(out, task)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].CreatedAt == out[j].CreatedAt {
-			return out[i].ID < out[j].ID
-		}
-		return out[i].CreatedAt > out[j].CreatedAt
-	})
-	if limit > 0 && len(out) > limit {
-		out = out[:limit]
-	}
-	// Deep-copy only the rows that leave the store. A dashboard asking for
-	// 20 rows must not serialize every historical task result, and list views
-	// never need the (potentially tens of MiB) reference payload.
-	for i := range out {
-		out[i] = cloneTask(out[i])
-		out[i].ReferenceImage = ""
-		out[i].ReferenceImages = nil
-	}
-	return out
-}
-
-// TaskCounts is a read-only projection for dashboards. It avoids cloning
-// result payloads for every historical task.
-type TaskCounts struct {
-	RequestsToday  int
-	Running        int
-	Queued         int
-	ImageTotal     int
-	ImageSucceeded int
-	VideoTotal     int
-	VideoSucceeded int
-}
-
-func (s *Store) TaskCounts(since int64) TaskCounts {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	var counts TaskCounts
-	for _, task := range s.tasks {
-		switch task.Status {
-		case model.TaskRunning:
-			counts.Running++
-		case model.TaskQueued:
-			counts.Queued++
-		}
-		if task.CreatedAt >= since {
-			counts.RequestsToday++
-		}
-		switch task.Kind {
-		case "image":
-			counts.ImageTotal++
-			if task.Status == model.TaskSucceeded {
-				counts.ImageSucceeded++
-			}
-		case "video":
-			counts.VideoTotal++
-			if task.Status == model.TaskSucceeded {
-				counts.VideoSucceeded++
-			}
-		}
-	}
-	return counts
-}
-func (s *Store) DeleteTask(id string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	old, ok := s.tasks[id]
-	if !ok {
-		return ErrNotFound
-	}
-	delete(s.tasks, id)
-	if err := s.saveTasksLocked(); err != nil {
-		s.tasks[id] = old
-		return err
 	}
 	return nil
 }
-func (s *Store) ClearTasks(keep int) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	old := s.tasks
-	active := make([]model.Task, 0)
-	terminal := make([]model.Task, 0)
-	for _, t := range old {
-		if t.Status == model.TaskRunning {
-			active = append(active, t)
-		} else {
-			terminal = append(terminal, t)
+
+func (s *Store) importLegacyEvents(tx *sql.Tx, path string) error {
+	var events []model.Event
+	if err := readJSON(path, &events); err != nil {
+		return err
+	}
+	for _, event := range events {
+		if event.ID == "" {
+			event.ID = randomID(8)
+		}
+		if event.Time.IsZero() {
+			event.Time = time.Now()
+		}
+		if event.Level == "" {
+			event.Level = "info"
+		}
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO events(id, time_ns, level, type, message, request_id, task_id, account_id, upstream_status, duration_ms)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, event.ID, event.Time.UnixNano(), event.Level, event.Type, event.Message, event.RequestID, event.TaskID, event.AccountID, event.Status, event.DurationMS); err != nil {
+			return err
 		}
 	}
-	sort.Slice(terminal, func(i, j int) bool { return terminal[i].CreatedAt > terminal[j].CreatedAt })
-	if keep > 0 && len(terminal) > keep {
-		terminal = terminal[:keep]
-	} else if keep <= 0 {
-		terminal = terminal[:0]
-	}
-	next := make(map[string]model.Task, len(active)+len(terminal))
-	for _, t := range active {
-		next[t.ID] = t
-	}
-	for _, t := range terminal {
-		next[t.ID] = t
-	}
-	removed := len(old) - len(next)
-	s.tasks = next
-	if err := s.saveTasksLocked(); err != nil {
-		s.tasks = old
-		return 0
-	}
-	return removed
-}
-func (s *Store) listTasksLocked(limit int) []model.Task {
-	out := make([]model.Task, 0, len(s.tasks))
-	for _, t := range s.tasks {
-		out = append(out, t)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt > out[j].CreatedAt })
-	if limit > 0 && len(out) > limit {
-		out = out[:limit]
-	}
-	return out
-}
-func (s *Store) saveTasksLocked() error {
-	return writeJSON(filepath.Join(s.dir, "tasks.json"), s.tasks)
+	return nil
 }
 
-func (s *Store) AddEvent(e model.Event) { s.mu.Lock(); defer s.mu.Unlock(); _ = s.appendEventLocked(e) }
-func (s *Store) appendEventLocked(e model.Event) error {
-	if e.ID == "" {
-		e.ID = randomID(8)
+func (s *Store) reconcileTasks() error {
+	// Preserve the old safety rule for this phase: a task that was queued or
+	// running when the process stopped is uncertain. Phase 5 will replace this
+	// with a durable queue and sub-state reconciliation.
+	// A running row with no account never acquired an account lease, so it was
+	// never submitted upstream. It is safe to put back in the durable queue.
+	if _, err := s.db.Exec(`UPDATE tasks SET status = ?, progress = 0, started_at = 0, completed_at = 0, error = '', updated_at = ? WHERE status = ? AND account_id = ''`,
+		string(model.TaskQueued), time.Now().Unix(), string(model.TaskRunning)); err != nil {
+		return err
 	}
-	if e.Time.IsZero() {
-		e.Time = time.Now()
-	}
-	if e.Level == "" {
-		e.Level = "info"
-	}
-	s.events = append([]model.Event{e}, s.events...)
-	if len(s.events) > 1000 {
-		s.events = s.events[:1000]
-	}
-	return writeJSON(filepath.Join(s.dir, "events.json"), s.events)
-}
-func (s *Store) Events(limit int) []model.Event {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if limit <= 0 || limit > len(s.events) {
-		limit = len(s.events)
-	}
-	return append([]model.Event(nil), s.events[:limit]...)
+	// A running row with an account may have been submitted and charged before
+	// the process stopped; keep it undecided instead of replaying it.
+	_, err := s.db.Exec(`UPDATE tasks SET status = ?, error = ?, updated_at = ? WHERE status = ?`,
+		string(model.TaskUnknown), "服务重启后无法确认上游结果，未自动重试", time.Now().Unix(),
+		string(model.TaskRunning))
+	return err
 }
 
-func (s *Store) Close() error { return nil }
-func normalizeAccount(a *model.Account) {
-	a.CookieCount = len(a.Cookies)
-	a.EssentialOK = a.Cookies["hatch_sess"] != "" && a.Cookies["hatch_vml"] != ""
-	if a.MaxConcurrency <= 0 {
-		a.MaxConcurrency = 1
-	}
-	if a.Status == "" {
-		if !a.Enabled {
-			a.Status = model.AccountDisabled
-		} else if a.OK != nil && !*a.OK {
-			a.Status = model.AccountError
-		} else if a.OK != nil && *a.OK {
-			a.Status = model.AccountActive
-		} else {
-			a.Status = model.AccountUnknown
-		}
-	}
-	if !a.Enabled {
-		a.Status = model.AccountDisabled
-	}
-	if exp := a.CookieExpiry["hatch_vml"]; exp > 0 {
-		a.ExpiresAt = exp
-		a.ExpiryEstimated = false
-	} else if a.ExpiresAt == 0 && a.CreatedAt > 0 {
-		a.ExpiresAt = a.CreatedAt + 2*86400
-		a.ExpiryEstimated = true
-	}
-}
-func sanitizeAccount(a model.Account) model.Account { a.Cookies = nil; a.CookieExpiry = nil; return a }
-func cloneAccount(a model.Account) model.Account {
-	a.Cookies = cloneStrings(a.Cookies)
-	a.CookieExpiry = cloneInt64s(a.CookieExpiry)
-	if a.Quota != nil {
-		q := *a.Quota
-		if q.ExtraUsedPct != nil {
-			value := *q.ExtraUsedPct
-			q.ExtraUsedPct = &value
-		}
-		a.Quota = &q
-	}
-	if a.OK != nil {
-		value := *a.OK
-		a.OK = &value
-	}
-	return a
-}
-func cloneTask(t model.Task) model.Task {
-	if t.ReferenceImages != nil {
-		t.ReferenceImages = append([]string(nil), t.ReferenceImages...)
-	}
-	if t.Result != nil {
-		out := make(map[string]any, len(t.Result))
-		for key, value := range t.Result {
-			out[key] = cloneResultValue(value)
-		}
-		t.Result = out
-	}
-	return t
+func (s *Store) setMeta(key, value string) error {
+	_, err := s.db.Exec(`INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, key, value)
+	return err
 }
 
-func cloneResultValue(value any) any {
-	switch typed := value.(type) {
-	case map[string]any:
-		out := make(map[string]any, len(typed))
-		for key, item := range typed {
-			out[key] = cloneResultValue(item)
-		}
-		return out
-	case []any:
-		out := make([]any, len(typed))
-		for index, item := range typed {
-			out[index] = cloneResultValue(item)
-		}
-		return out
-	default:
-		return value
-	}
-}
-func normalizeTask(t *model.Task) {
-	switch t.Status {
-	case "processing":
-		t.Status = model.TaskRunning
-	case "completed":
-		t.Status = model.TaskSucceeded
-	case "success", "done":
-		t.Status = model.TaskSucceeded
-	case "":
-		t.Status = model.TaskUnknown
-	}
-}
-func cloneStrings(in map[string]string) map[string]string {
-	if in == nil {
-		return nil
-	}
-	out := make(map[string]string, len(in))
-	for k, v := range in {
-		out[k] = v
-	}
-	return out
-}
-func cloneInt64s(in map[string]int64) map[string]int64 {
-	if in == nil {
-		return nil
-	}
-	out := make(map[string]int64, len(in))
-	for k, v := range in {
-		out[k] = v
-	}
-	return out
-}
+// ---------------------------------------------------------------------------
+// accounts
+// ---------------------------------------------------------------------------
+
 func randomID(n int) string {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
 		panic(err)
 	}
 	return hex.EncodeToString(b)
-}
-func readJSON(path string, out any) error {
-	b, err := os.ReadFile(path)
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if len(b) == 0 {
-		return nil
-	}
-	return json.Unmarshal(b, out)
-}
-func writeJSON(path string, value any) error {
-	b, err := json.MarshalIndent(value, "", "  ")
-	if err != nil {
-		return err
-	}
-	b = append(b, '\n')
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
-	if err != nil {
-		return err
-	}
-	name := tmp.Name()
-	defer os.Remove(name)
-	if err = tmp.Chmod(0o600); err == nil {
-		_, err = tmp.Write(b)
-	}
-	if err == nil {
-		// Flush file data before the rename so a crash cannot leave a
-		// zero-length or truncated state file in place of the previous one.
-		err = tmp.Sync()
-	}
-	if closeErr := tmp.Close(); err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		return err
-	}
-	if err := os.Rename(name, path); err != nil {
-		return err
-	}
-	syncDir(filepath.Dir(path))
-	return nil
-}
-
-func syncDir(dir string) {
-	handle, err := os.Open(dir)
-	if err != nil {
-		return
-	}
-	_ = handle.Sync()
-	_ = handle.Close()
-}
-func backup(path string) (string, error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return "", err
-	}
-	name := fmt.Sprintf("%s.%s.bak", filepath.Base(path), time.Now().UTC().Format("20060102T150405Z"))
-	dest := filepath.Join(filepath.Dir(path), "backups", name)
-	if err := os.WriteFile(dest, b, 0o600); err != nil {
-		return "", err
-	}
-	return dest, nil
-}
-
-func sanitizeLegacyAccounts(path string) error {
-	var accounts []model.Account
-	if err := readJSON(path, &accounts); err != nil {
-		return err
-	}
-	if len(accounts) == 0 {
-		return nil
-	}
-	for i := range accounts {
-		accounts[i].Cookies = nil
-		accounts[i].CookieExpiry = nil
-		accounts[i].CookieCount = 0
-		accounts[i].EssentialOK = false
-		accounts[i].Note = "legacy plaintext credentials redacted after migration"
-	}
-	return writeJSON(path, accounts)
-}
-func (s *Store) Backup(ctx context.Context) (string, error) {
-	select {
-	case <-ctx.Done():
-		return "", ctx.Err()
-	default:
-	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	dir := filepath.Join(s.dir, "backups", "manual-"+time.Now().UTC().Format("20060102T150405Z"))
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", err
-	}
-	for _, name := range []string{"accounts.secure.json", "api_key.secure", "tasks.json", "events.json"} {
-		b, err := os.ReadFile(filepath.Join(s.dir, name))
-		if errors.Is(err, fs.ErrNotExist) {
-			continue
-		}
-		if err != nil {
-			return "", err
-		}
-		if err := os.WriteFile(filepath.Join(dir, name), b, 0o600); err != nil {
-			return "", err
-		}
-	}
-	return dir, nil
-}
-func (s *Store) SaveAPIKey(key string) error {
-	if s.box == nil {
-		return errors.New("credential key required to persist API key")
-	}
-	payload, err := s.box.Seal([]byte(key))
-	if err != nil {
-		return err
-	}
-	return writeJSON(filepath.Join(s.dir, "api_key.secure"), diskAPIKey{Version: 1, Payload: payload})
-}
-
-func (s *Store) LoadAPIKey() (string, error) {
-	var disk diskAPIKey
-	if err := readJSON(filepath.Join(s.dir, "api_key.secure"), &disk); err != nil {
-		return "", err
-	}
-	if disk.Payload == "" {
-		return "", nil
-	}
-	if s.box == nil {
-		return "", errors.New("stored API key is encrypted but credential key is missing")
-	}
-	plaintext, err := s.box.Open(disk.Payload)
-	if err != nil {
-		return "", err
-	}
-	return string(plaintext), nil
 }
 
 func SafeFilename(name string) bool {

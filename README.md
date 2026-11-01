@@ -290,13 +290,19 @@ curl http://127.0.0.1:18610/v1/videos \
 - `GET /v1/videos/{id}` 或 `GET /v1/videos/generations/{id}`
 - `GET /v1/media/{name}`
 
+### 管理接口补充
+
+- `POST /admin/tasks/{id}/retry`：显式重试失败/取消任务；`unknown` 任务需要 `{"force":true}`，因为可能已经扣费。
+- `GET /admin/metrics`：账号、调度器、队列、任务计数、goroutine/堆内存快照。
+- `POST /admin/settings/restore`：校验 SQLite 备份并暂存，重启服务后原子恢复。
+
 ## ⚙️ 配置
 
 必填的就三个：
 
 | 变量 | 说明 |
 |---|---|
-| `MUSE2API_KEY` | `/v1/*` 的 Bearer Key。启动后也能在后台轮换，轮换结果写到 `data/api_key.secure` |
+| `MUSE2API_KEY` | `/v1/*` 的 Bearer Key。启动后也能在后台轮换，轮换结果加密写入 `data/muse2api.db` |
 | `MUSE2API_ADMIN_PASSWORD` | 后台管理员密码，至少 8 位 |
 | `MUSE2API_CREDENTIAL_KEY` | 32 字节随机值的 base64，用来加密账号 Cookie。这个丢了，旧账号就解不开了 |
 
@@ -310,13 +316,17 @@ curl http://127.0.0.1:18610/v1/videos \
 | `MUSE2API_BIND` | `127.0.0.1` | Compose 绑定地址 |
 | `MUSE2API_UID` / `MUSE2API_GID` | `10001` | 容器运行用户，得和 `data/` 所有者一致 |
 | `MUSE2API_MAX_UPLOAD_BYTES` | `41943040` | 请求体上限；24 MiB 原图转 base64 后需要更宽的上限，改大时记得同步改 Nginx 的 `client_max_body_size` |
+| `MUSE2API_CHAT_CONCURRENCY` | `0` | 对话类别上限；`0` 表示沿用 `MUSE2API_CONCURRENCY` |
+| `MUSE2API_IMAGE_CONCURRENCY` | `0` | 图片类别上限；`0` 表示沿用全局上限 |
+| `MUSE2API_VIDEO_CONCURRENCY` | `1` | 视频类别上限；视频很慢，默认只占一个槽位，避免饿死对话 |
+| `MUSE2API_PROXY` | 空 | 上游 HTTP/WS bootstrap、媒体下载和额度请求使用的代理 URL；也可用 `_FILE` |
 | `MUSE2API_REF_IMAGE_LOCAL_FILES` | `0` | 设为 `1` 才允许参考图读取服务器本地文件路径 |
 | `MUSE2API_REF_IMAGE_PRIVATE_FETCH` | `0` | 设为 `1` 才允许参考图下载私网/本机 URL；默认只允许公网并逐跳检查重定向 |
 | `MUSE2API_KEEPALIVE_INTERVAL_HOURS` | `6` | 账号保活间隔（小时）；`0` 关闭。只发 `/api/session`，不唤醒 VM、不生成内容 |
 | `MUSE2API_KEEPALIVE_DISABLED_ACCOUNTS` | `0` | 设为 `1` 时保活跳过已禁用账号 |
 | `MUSE2API_LOG_LEVEL` | `info` | 日志级别 |
 
-其余的超时、并发、队列、目录这些，都在 `.env.example` 里。注意 `.env.example` 里的占位值会被程序拒绝，别直接拿来启动。
+其余的超时、并发、队列、目录这些，都在 `.env.example` 里。10 个账号的常见配置是 `MUSE2API_CONCURRENCY=8`、`MUSE2API_VIDEO_CONCURRENCY=1`，把长视频限制在一个槽位，避免饿死对话和图片。注意 `.env.example` 里的占位值会被程序拒绝，别直接拿来启动。
 
 ### 协议实现
 
@@ -333,7 +343,7 @@ WebSocket:      wss://hatch.metaaivm.com/v1/noise?vm_id=...&auth_token=...&app_i
 额度:           POST /settings（Next-Action: fetchSubscriptionAction，React Flight 响应）
 ```
 
-已用真实账号验收：文生图、参考图编辑、文生视频、混合并发都能完成，媒体正常落盘；对话按上游 `chat.subscribe` 的增量逐字转发为 SSE；视频结果的时长和分辨率从 MP4 元数据解析。
+已用真实账号验收：文生图、参考图编辑、多图参考、参考图视频、文生视频、混合并发都能完成，媒体正常落盘；对话按上游 `chat.subscribe` 的增量逐字转发为 SSE；视频结果的时长和分辨率从 MP4 元数据解析。
 
 额度刷新也走纯 HTTP：Muse 的设置页通过 Next.js server action `fetchSubscriptionAction` 返回订阅快照（套餐、每周用量、额外额度），后台只发一次 POST，不唤醒 VM、不启动浏览器。action id 会随部署变化，失效时自动扫描设置页加载的脚本重新定位并缓存。
 
@@ -363,17 +373,20 @@ MUSE2API_REF_IMAGE_PRIVATE_FETCH=1
 
 参考图超限、MIME 不对、下载失败或地址被策略拒绝，都会在创建任务前返回 400。
 
+上游 `chat.stream` 对单条内联附件约有 64 KiB 的硬上限，超过时网关会直接断开 WebSocket（1006）。服务会在发送前把超限的 PNG/JPEG/GIF/WebP 参考图等比缩小并重新编码：不透明图用 JPEG，带透明通道的图保持 PNG；压到约 60 KiB 以内再上传。实在压不进上限、或超大图片无法解码时，会在创建任务前返回 400，而不是等上游断连。
+
 ## 🕳️ 几个坑，提前说
 
 - `gpt-4o`、`claude-sonnet-4` 会落到 `muse-spark`，`dall-e-3` 落到 `muse-image`，`sora` 落到 `muse-video`。这些只是兼容别名，不代表对应的官方模型能力。
-- 上游一个账号只有一个 VM，会话是全局串行的。本地任务并发不等于上游并行生成。
+- 上游一个账号只有一个 VM，会话是全局串行的。`max_concurrency` 字段为兼容保留，实际每个账号同一时间只跑一个上游回合；本地并发只发生在不同账号之间。
 - 视频只能单片段，大约 10 秒、720p；`duration` 不控制上游；比例只能靠提示词；长视频自己分段。
 - 参考图默认只接受 data URL、base64 和公网 http(s) URL；本地文件和私网地址默认拒绝，需要时用上面两个开关显式放开。参考图超限、MIME 不对或下载失败会在创建任务前直接返回 400。
 - 账号必填 Cookie 只有 `hatch_sess` 和 `hatch_vml`；`hatch_native_auth_device` 是可选项。
-- 服务重启时，遗留的排队/运行中任务会标成 `unknown`，不会自动重放，避免重复扣费。管理员会话保存在内存，重启后要重新登录。
-- 后台的备份恢复要重启服务，当前进程不会热加载恢复后的数据。
-- 兼容旧版 `accounts.json/tasks.json`；首次启动会把旧账号加密迁移。升级前先备份 `data/` 和加密 Key。
-- `data/` 里的账号密文和生成的媒体，都按敏感数据对待。
+- 服务重启时，`queued` 任务会继续执行；已经分配账号的 `running` 任务因为可能已经提交上游，会标成 `unknown`，不会自动重放，避免重复扣费；尚未分配账号的 `running` 任务会退回 `queued` 并继续执行。管理员会话保存在内存，重启后要重新登录。
+- 后台备份是 SQLite 在线快照；恢复会先校验备份并暂存为 `muse2api.db.restore`，重启服务后原子替换生效，运行中的旧进程不会覆盖恢复结果。
+- 存储使用 `data/muse2api.db`（SQLite/WAL）；首次启动会把旧版 `accounts.secure.json`、`accounts.json`、`tasks.json`、`events.json`、`api_key.secure` 迁移到数据库，旧文件保留/脱敏，不删除。
+- 账号过期只认真实 `Set-Cookie` 的 `Expires/Max-Age`，不再用 `CreatedAt + 48h` 的估算值把账号踢出调度池；估算值只用于展示。
+- `data/` 里的账号密文、数据库和生成的媒体，都按敏感数据对待。
 
 ## 🧯 遇到问题先看这几条
 
@@ -491,8 +504,8 @@ internal/muse/capabilities/  上游能力声明
 internal/muse/protocol/  驱动接口、提示词模板
 internal/muse/protocol/hatch/  纯协议驱动：Noise XX、protobuf 帧、聊天与媒体下载
 internal/refimage/       参考图解析、大小/MIME 校验、SSRF 防护
-internal/storage/        AES-GCM 账号存储、任务与事件持久化
-internal/scheduler/      账号池与并发调度
+internal/storage/        AES-GCM 账号存储、SQLite/WAL 任务/事件/媒体仓储
+internal/scheduler/      内存账号索引、类别限流与租约调度
 web/                     React + TypeScript 管理后台
 browser-extension/       Chrome / Edge MV3 导号扩展
 deploy/                  Docker secrets、systemd、Nginx 模板
@@ -504,7 +517,7 @@ docs/screenshots/        README 截图
 - 只导自己的账号。不要批量注册、转卖额度，也别拿它绕上游限制。
 - 管理员密码、API Key、`MUSE2API_CREDENTIAL_KEY` 分开备份。加密 Key 丢了，旧账号 Cookie 就回不来了。
 - 生产环境上 HTTPS。服务不启动浏览器，也没有 CDP 端口需要暴露。
-- `data/` 里有账号密文、媒体和浏览器 profile，别提交到 Git，也别扔进公开备份。
+- `data/` 里有账号密文、SQLite 数据库和媒体，别提交到 Git，也别扔进公开备份。
 - 参考图的本地文件和私网开关默认关闭；只有在确认调用方可信时才打开。
 
 ## License

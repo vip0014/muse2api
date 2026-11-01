@@ -31,18 +31,101 @@ func (r *RpcResult) JSON(out any) error {
 	return json.Unmarshal(r.Body, out)
 }
 
+const (
+	maxUnaryBody    = 64 << 20
+	maxStreamRecord = 8 << 20
+	streamQueueSize = 512
+)
+
+var (
+	errProtocol         = errors.New("protocol error")
+	errSlowConsumer     = errors.New("stream consumer stalled")
+	errResponseTooLarge = errors.New("response body too large")
+	errStreamDropped    = errors.New("stream dropped")
+)
+
+// RpcStatusError preserves an application-level HTTP status returned by the
+// gateway. Callers can inspect Status for expected 404 fallbacks while still
+// treating every non-2xx as an error instead of an empty success.
+type RpcStatusError struct {
+	Status int
+	Body   []byte
+}
+
+func (e *RpcStatusError) Error() string {
+	return fmt.Sprintf("upstream RPC HTTP %d: %s", e.Status, truncate(e.Body, 180))
+}
+
+// HTTPStatus lets callers classify gateway status codes without importing the
+// hatch transport implementation.
+func (e *RpcStatusError) HTTPStatus() int { return e.Status }
+
 type stream struct {
 	id      int64
 	status  int
 	headers []Header
 	body    []byte
 	done    chan struct{}
-	err     error
 
 	mu      sync.Mutex
 	closed  bool
-	records chan map[string]any // non-nil for streaming RPCs
+	err     error
+	records chan map[string]any // consumer-visible channel, closed by pump
+	input   chan map[string]any // read-loop -> pump, never closed by producer
 	buf     []byte
+	bodyCap int
+	sink    func([]byte) error
+}
+
+func newStream(id int64, streaming bool) *stream {
+	s := &stream{id: id, done: make(chan struct{}), bodyCap: maxUnaryBody}
+	if streaming {
+		s.input = make(chan map[string]any, streamQueueSize)
+		s.records = make(chan map[string]any, streamQueueSize)
+		go s.pump()
+	}
+	return s
+}
+
+// pump is the only goroutine allowed to close records. This makes a late
+// body_chunk, a reset, or a concurrent Close safe: producers select on done
+// instead of racing a close on the consumer channel.
+func (s *stream) pump() {
+	defer close(s.records)
+	for {
+		select {
+		case record := <-s.input:
+			// Prefer the consumer channel over done here. Once a record has
+			// been accepted from the read loop, dropping it on a concurrent
+			// finish is exactly the final-record loss observed in the fake
+			// gateway test.
+			select {
+			case s.records <- record:
+				continue
+			default:
+				select {
+				case <-s.done:
+					return
+				default:
+					s.finish(errSlowConsumer)
+					return
+				}
+			}
+		case <-s.done:
+			for {
+				select {
+				case record := <-s.input:
+					select {
+					case s.records <- record:
+					default:
+						return
+					}
+				default:
+					return
+				}
+			}
+		}
+	}
 }
 
 func (s *stream) finish(err error) {
@@ -53,12 +136,26 @@ func (s *stream) finish(err error) {
 	}
 	s.closed = true
 	s.err = err
-	records := s.records
 	s.mu.Unlock()
 	close(s.done)
-	if records != nil {
-		close(records)
-	}
+}
+
+func (s *stream) terminalError() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.err
+}
+
+func (s *stream) setSink(sink func([]byte) error) {
+	s.mu.Lock()
+	s.sink = sink
+	s.mu.Unlock()
+}
+
+func (s *stream) getSink() func([]byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sink
 }
 
 // feedBody accumulates plain bodies and parses line-delimited JSON for
@@ -67,8 +164,28 @@ func (s *stream) feedBody(data []byte) {
 	if len(data) == 0 {
 		return
 	}
-	if s.records == nil {
+	select {
+	case <-s.done:
+		return
+	default:
+	}
+	if s.input == nil {
+		sink := s.getSink()
+		if sink != nil && s.status >= 200 && s.status < 300 {
+			if err := sink(data); err != nil {
+				s.finish(err)
+			}
+			return
+		}
+		if len(s.body)+len(data) > s.bodyCap {
+			s.finish(fmt.Errorf("upstream response body exceeded %d bytes; %w", s.bodyCap, errResponseTooLarge))
+			return
+		}
 		s.body = append(s.body, data...)
+		return
+	}
+	if len(s.buf)+len(data) > maxStreamRecord {
+		s.finish(fmt.Errorf("stream record exceeded %d bytes; %w", maxStreamRecord, errProtocol))
 		return
 	}
 	s.buf = append(s.buf, data...)
@@ -82,9 +199,8 @@ func (s *stream) feedBody(data []byte) {
 		if len(line) == 0 {
 			continue
 		}
-		var record map[string]any
-		if json.Unmarshal(line, &record) == nil {
-			s.records <- record
+		if !s.feedRecord(line) {
+			return
 		}
 	}
 	tail := bytes.TrimSpace(s.buf)
@@ -92,30 +208,67 @@ func (s *stream) feedBody(data []byte) {
 		var record map[string]any
 		if json.Unmarshal(tail, &record) == nil {
 			s.buf = nil
-			s.records <- record
+			s.feedRecord(tail)
 		}
+	}
+}
+
+func (s *stream) feedRecord(line []byte) bool {
+	select {
+	case <-s.done:
+		return false
+	default:
+	}
+	var record map[string]any
+	if json.Unmarshal(line, &record) != nil {
+		// A non-JSON record is a protocol error, not a silent end-of-stream.
+		s.finish(fmt.Errorf("invalid stream record: %w", errProtocol))
+		return false
+	}
+	select {
+	case s.input <- record:
+		return true
+	case <-s.done:
+		return false
+	default:
+		s.finish(fmt.Errorf("stream consumer stalled; %w", errSlowConsumer))
+		return false
 	}
 }
 
 // Conn is one Noise-encrypted hatch gateway connection.
 type Conn struct {
-	ws     *websocket.Conn
-	tx     *CipherState
-	rx     *CipherState
-	reasm  *reassembler
-	wmu    sync.Mutex
-	mu     sync.Mutex
+	ws      *websocket.Conn
+	tx      *CipherState
+	rx      *CipherState
+	reasm   *reassembler
+	wmu     sync.Mutex
+	mu      sync.Mutex
 	streams map[int64]*stream
-	nextID int64
-	closed bool
-	err    error
+	nextID  int64
+	closed  bool
+	err     error
+	done    chan struct{}
 }
 
-const handshakeTimeout = 20 * time.Second
+const (
+	handshakeTimeout = 20 * time.Second
+	readTimeout      = 120 * time.Second
+	writeTimeout     = 30 * time.Second
+	pingInterval     = 30 * time.Second
+)
 
 // Dial opens the WebSocket, performs the XX handshake and starts the read loop.
 func Dial(ctx context.Context, wsURL string) (*Conn, error) {
-	dialer := websocket.Dialer{HandshakeTimeout: handshakeTimeout, ReadBufferSize: 1 << 20, WriteBufferSize: 1 << 20}
+	return DialWithDialer(ctx, wsURL, nil)
+}
+
+// DialWithDialer is the test/proxy seam. A nil dialer keeps the production
+// defaults.
+func DialWithDialer(ctx context.Context, wsURL string, dialer *websocket.Dialer) (*Conn, error) {
+	if dialer == nil {
+		dialer = &websocket.Dialer{HandshakeTimeout: handshakeTimeout, ReadBufferSize: 1 << 20, WriteBufferSize: 1 << 20}
+	}
 	ws, resp, err := dialer.DialContext(ctx, wsURL, nil)
 	if err != nil {
 		status := ""
@@ -171,7 +324,12 @@ func Dial(ctx context.Context, wsURL string) (*Conn, error) {
 		_ = ws.Close()
 		return nil, err
 	}
-	c := &Conn{ws: ws, tx: tx, rx: rx, reasm: newReassembler(), streams: map[int64]*stream{}, nextID: 1}
+	_ = ws.SetReadDeadline(time.Now().Add(readTimeout))
+	ws.SetPongHandler(func(string) error {
+		return ws.SetReadDeadline(time.Now().Add(readTimeout))
+	})
+	c := &Conn{ws: ws, tx: tx, rx: rx, reasm: newReassembler(), streams: map[int64]*stream{}, nextID: 1, done: make(chan struct{})}
+	go c.heartbeat()
 	go c.readLoop()
 	return c, nil
 }
@@ -202,11 +360,28 @@ func (c *Conn) shutdown(err error) {
 		pending = append(pending, s)
 	}
 	c.streams = map[int64]*stream{}
+	close(c.done)
 	c.mu.Unlock()
 	for _, s := range pending {
 		s.finish(err)
 	}
 	_ = c.ws.Close()
+}
+
+func (c *Conn) heartbeat() {
+	ticker := time.NewTicker(pingInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.done:
+			return
+		case <-ticker.C:
+			if err := c.ws.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second)); err != nil {
+				c.shutdown(fmt.Errorf("gateway ping: %w", err))
+				return
+			}
+		}
+	}
 }
 
 func (c *Conn) readLoop() {
@@ -216,6 +391,7 @@ func (c *Conn) readLoop() {
 			c.shutdown(fmt.Errorf("gateway read: %w", err))
 			return
 		}
+		_ = c.ws.SetReadDeadline(time.Now().Add(readTimeout))
 		if msgType != websocket.BinaryMessage {
 			continue
 		}
@@ -234,11 +410,13 @@ func (c *Conn) readLoop() {
 		}
 		serviceFrameBytes, err := decodeServiceResponse(payload)
 		if err != nil {
-			continue
+			c.shutdown(fmt.Errorf("gateway service response: %w", err))
+			return
 		}
 		frame, err := decodeServiceFrame(serviceFrameBytes)
 		if err != nil {
-			continue
+			c.shutdown(fmt.Errorf("gateway service frame: %w", err))
+			return
 		}
 		c.handleFrame(frame)
 	}
@@ -254,6 +432,7 @@ func (c *Conn) handleFrame(frame serviceFrame) {
 	switch frame.Kind {
 	case "response":
 		if frame.Response == nil {
+			s.finish(fmt.Errorf("response frame missing application payload: %w", errProtocol))
 			return
 		}
 		s.status = frame.Response.Status
@@ -272,20 +451,27 @@ func (c *Conn) handleFrame(frame serviceFrame) {
 	}
 }
 
-func (c *Conn) newStream() *stream {
+func (c *Conn) newStreamState(streaming bool) (*stream, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.closed {
+		return nil, errors.New("gateway connection closed")
+	}
 	id := c.nextID
 	c.nextID++
-	s := &stream{id: id, done: make(chan struct{})}
+	s := newStream(id, streaming)
 	c.streams[id] = s
-	return s
+	return s, nil
 }
 
 func (c *Conn) dropStream(id int64) {
 	c.mu.Lock()
+	s := c.streams[id]
 	delete(c.streams, id)
 	c.mu.Unlock()
+	if s != nil {
+		s.finish(errStreamDropped)
+	}
 }
 
 func randomRequestID() string {
@@ -301,6 +487,7 @@ func (c *Conn) writeEncrypted(payload []byte) error {
 	}
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
+	_ = c.ws.SetWriteDeadline(time.Now().Add(writeTimeout))
 	for _, chunk := range chunks {
 		encrypted, err := c.tx.EncryptWithAD(nil, chunk)
 		if err != nil {
@@ -315,6 +502,18 @@ func (c *Conn) writeEncrypted(payload []byte) error {
 
 // Request performs one unary RPC (HTTP-like verb + path over the gateway).
 func (c *Conn) Request(ctx context.Context, method, path string, params map[string]any, timeout time.Duration) (*RpcResult, error) {
+	return c.request(ctx, method, path, params, timeout, nil)
+}
+
+// RequestTo performs a unary RPC while streaming a successful body to sink.
+// The gateway may deliver media in many body_chunks; this keeps large media
+// out of process memory. Non-2xx bodies are still captured (bounded) for the
+// error path.
+func (c *Conn) RequestTo(ctx context.Context, method, path string, params map[string]any, timeout time.Duration, sink func([]byte) error) (*RpcResult, error) {
+	return c.request(ctx, method, path, params, timeout, sink)
+}
+
+func (c *Conn) request(ctx context.Context, method, path string, params map[string]any, timeout time.Duration, sink func([]byte) error) (*RpcResult, error) {
 	if c.IsClosed() {
 		return nil, errors.New("gateway connection closed")
 	}
@@ -352,7 +551,11 @@ func (c *Conn) Request(ctx context.Context, method, path string, params map[stri
 		headers = append([]Header{{Key: "Content-Type", Value: "application/json"}}, headers...)
 	}
 
-	s := c.newStream()
+	s, err := c.newStreamState(false)
+	if err != nil {
+		return nil, err
+	}
+	s.setSink(sink)
 	defer c.dropStream(s.id)
 	frameBytes := encodeServiceFrameRequest(s.id, ApplicationRequest{
 		Verb: method, Path: path, Headers: headers, Body: body, EndBody: true,
@@ -375,8 +578,11 @@ func (c *Conn) Request(ctx context.Context, method, path string, params map[stri
 		_ = c.writeEncrypted(encodeServiceRequest(serviceDaemon, resetFrame))
 		return nil, waitCtx.Err()
 	case <-s.done:
-		if s.err != nil {
-			return nil, s.err
+		if err := s.terminalError(); err != nil {
+			return nil, err
+		}
+		if s.status >= 400 {
+			return nil, &RpcStatusError{Status: s.status, Body: append([]byte(nil), s.body...)}
 		}
 		return &RpcResult{Status: s.status, Headers: s.headers, Body: s.body}, nil
 	}
@@ -422,8 +628,10 @@ func (c *Conn) OpenStream(ctx context.Context, path string, params map[string]an
 	if err != nil {
 		return nil, err
 	}
-	s := c.newStream()
-	s.records = make(chan map[string]any, 512)
+	s, err := c.newStreamState(true)
+	if err != nil {
+		return nil, err
+	}
 	headers := []Header{
 		{Key: "Content-Type", Value: "application/json"},
 		{Key: "x-request-id", Value: randomRequestID()},

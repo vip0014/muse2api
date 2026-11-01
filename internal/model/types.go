@@ -14,27 +14,30 @@ const (
 )
 
 type Account struct {
-	ID              string            `json:"id"`
-	Label           string            `json:"label"`
-	Cookies         map[string]string `json:"cookies,omitempty"`
-	CookieExpiry    map[string]int64  `json:"cookies_exp,omitempty"`
-	CookieCount     int               `json:"cookie_count"`
-	EssentialOK     bool              `json:"essential_ok"`
-	Status          AccountStatus     `json:"status"`
-	Enabled         bool              `json:"enabled"`
-	CreatedAt       int64             `json:"created_at"`
-	LastUsed        int64             `json:"last_used,omitempty"`
-	LastChecked     int64             `json:"checked_at,omitempty"`
-	LastKeepalive   int64             `json:"last_keepalive,omitempty"`
-	UseCount        int               `json:"use_count"`
-	ExpiresAt       int64             `json:"expires_at,omitempty"`
-	ExpiryEstimated bool              `json:"expires_estimated"`
-	LastError       string            `json:"last_error,omitempty"`
-	Note            string            `json:"note,omitempty"`
-	MaxConcurrency  int               `json:"max_concurrency"`
-	Quota           *Quota            `json:"quota,omitempty"`
-	OK              *bool             `json:"ok"`
-	SyncedAt        int64             `json:"synced_at,omitempty"`
+	ID                 string            `json:"id"`
+	Label              string            `json:"label"`
+	Cookies            map[string]string `json:"cookies,omitempty"`
+	CookieExpiry       map[string]int64  `json:"cookies_exp,omitempty"`
+	CookieCount        int               `json:"cookie_count"`
+	EssentialOK        bool              `json:"essential_ok"`
+	Status             AccountStatus     `json:"status"`
+	Enabled            bool              `json:"enabled"`
+	CreatedAt          int64             `json:"created_at"`
+	LastUsed           int64             `json:"last_used,omitempty"`
+	LastChecked        int64             `json:"checked_at,omitempty"`
+	LastKeepalive      int64             `json:"last_keepalive,omitempty"`
+	UseCount           int               `json:"use_count"`
+	ExpiresAt          int64             `json:"expires_at,omitempty"`
+	ExpiryEstimated    bool              `json:"expires_estimated"`
+	LastError          string            `json:"last_error,omitempty"`
+	Note               string            `json:"note,omitempty"`
+	MaxConcurrency     int               `json:"max_concurrency"`
+	FailureCount       int               `json:"failure_count,omitempty"`
+	CooldownUntil      int64             `json:"cooldown_until,omitempty"`
+	CredentialsVersion int64             `json:"credentials_version,omitempty"`
+	Quota              *Quota            `json:"quota,omitempty"`
+	OK                 *bool             `json:"ok"`
+	SyncedAt           int64             `json:"synced_at,omitempty"`
 }
 
 type Quota struct {
@@ -68,7 +71,7 @@ func ValidTaskTransition(from, to TaskStatus) bool {
 	case TaskQueued:
 		return to == TaskRunning || to == TaskCancelled || to == TaskFailed || to == TaskUnknown
 	case TaskRunning:
-		return to == TaskSucceeded || to == TaskFailed || to == TaskCancelled || to == TaskUnknown
+		return to == TaskSucceeded || to == TaskFailed || to == TaskCancelled || to == TaskUnknown || to == TaskQueued
 	default:
 		return false
 	}
@@ -76,6 +79,7 @@ func ValidTaskTransition(from, to TaskStatus) bool {
 
 type Task struct {
 	ID              string         `json:"id"`
+	TaskID          string         `json:"task_id,omitempty"`
 	Object          string         `json:"object"`
 	Kind            string         `json:"kind"`
 	Prompt          string         `json:"prompt"`
