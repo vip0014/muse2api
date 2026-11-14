@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"muse2api/internal/model"
+	"muse2api/internal/muse/protocol"
 	"muse2api/internal/storage"
 )
 
@@ -31,12 +33,10 @@ func credentialKeyFromEnvFile(home string) ([]byte, error) {
 	return nil, errors.New("MUSE2API_CREDENTIAL_KEY not found in .env")
 }
 
-// TestLiveGatewayHandshake validates the real protocol end to end against a
-// stored account: HTTP bootstrap, Noise XX handshake, then one unary RPC.
-func TestLiveGatewayHandshake(t *testing.T) {
-	if os.Getenv("HATCH_LIVE") == "" {
-		t.Skip("set HATCH_LIVE=1 to run the live gateway test")
-	}
+// openLiveStore opens the workspace data directory. Live tests are opt-in
+// because they contact muse.ai with the stored account cookies.
+func openLiveStore(t *testing.T) *storage.Store {
+	t.Helper()
 	home := os.Getenv("MUSE2API_HOME")
 	if home == "" {
 		home = `E:\me-project\muse2api`
@@ -49,6 +49,12 @@ func TestLiveGatewayHandshake(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
+	t.Cleanup(func() { _ = store.Close() })
+	return store
+}
+
+func liveAccount(t *testing.T, store *storage.Store) model.Account {
+	t.Helper()
 	accounts := store.ListAccounts()
 	if len(accounts) == 0 {
 		t.Fatalf("no account in store")
@@ -63,6 +69,17 @@ func TestLiveGatewayHandshake(t *testing.T) {
 	}
 	sort.Strings(names)
 	t.Logf("account=%s cookies=%d names=%v", account.ID, len(account.Cookies), names)
+	return account
+}
+
+// TestLiveGatewayHandshake validates the real protocol end to end against a
+// stored account: HTTP bootstrap, Noise XX handshake, then one unary RPC.
+func TestLiveGatewayHandshake(t *testing.T) {
+	if os.Getenv("HATCH_LIVE") == "" {
+		t.Skip("set HATCH_LIVE=1 to run the live gateway test")
+	}
+	store := openLiveStore(t)
+	account := liveAccount(t, store)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -91,4 +108,35 @@ func TestLiveGatewayHandshake(t *testing.T) {
 	if result.Status != 200 {
 		t.Fatalf("unexpected status %d", result.Status)
 	}
+}
+
+// TestLiveQuotaRefresh verifies the settings-page server-action discovery and
+// the subscription snapshot against the real deployment. Run it after the
+// upstream rotates its action id:
+//
+//	HATCH_LIVE=1 go test ./internal/muse/protocol/hatch -run TestLiveQuotaRefresh -v
+func TestLiveQuotaRefresh(t *testing.T) {
+	if os.Getenv("HATCH_LIVE") == "" {
+		t.Skip("set HATCH_LIVE=1 to run the live quota test")
+	}
+	store := openLiveStore(t)
+	account := liveAccount(t, store)
+
+	base, err := url.Parse("https://muse.ai")
+	if err != nil {
+		t.Fatalf("parse site: %v", err)
+	}
+	client := NewClientWithWSURL(base, &http.Client{Timeout: 25 * time.Second}, "")
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	quota, err := client.QueryQuota(ctx, protocol.AccountCredentials{
+		ID:           account.ID,
+		Cookies:      account.Cookies,
+		CookieExpiry: account.CookieExpiry,
+	})
+	if err != nil {
+		t.Fatalf("quota: %v", err)
+	}
+	t.Logf("plan=%s weekly=%.0f%% reset=%s extra=%s extraLeft=%s",
+		quota.Plan, quota.WeeklyUsedPct, quota.WeeklyReset, quota.ExtraExpires, quota.ExtraLeft)
 }

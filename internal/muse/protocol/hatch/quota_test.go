@@ -1,8 +1,16 @@
 package hatch
 
 import (
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
+
+	"muse2api/internal/muse/protocol"
 )
 
 const quotaFlightSample = "0:{\"a\":\"$@1\",\"q\":\"\",\"i\":false}\n" +
@@ -68,4 +76,101 @@ func TestActionIDFromChunk(t *testing.T) {
 	if id := actionIDFromChunk("no action here"); id != "" {
 		t.Fatalf("unexpected id %q", id)
 	}
+	renamed := `(0,g.createServerReference)("0123456789abcdef0123456789abcdef01234567",g.callServer,void 0,g.findSourceMapURL,"getSubscriptionAction")`
+	if id := subscriptionActionFromChunk(renamed); id != "0123456789abcdef0123456789abcdef01234567" {
+		t.Fatalf("renamed action id = %q", id)
+	}
+}
+
+func TestChunkPatternsCoverBothBundlers(t *testing.T) {
+	paths := []string{
+		`/_next/static/immutable/chunks/04d5giu9rtvpf.js`,
+		`/_next/static/chunks/app/(main)/settings/page-abc123.js`,
+		`/_next/static/immutable/chunks/2x30p-winv-at.js?dpl=dpl_abc`,
+	}
+	for _, path := range paths {
+		if got := scriptURLRe.FindString(path); got != path {
+			t.Fatalf("scriptURLRe(%q) = %q", path, got)
+		}
+	}
+	lazy := `e.u("static/immutable/chunks/1y-g2x5eo-k-y.js")`
+	if got := chunkPathRe.FindString(lazy); got != "static/immutable/chunks/1y-g2x5eo-k-y.js" {
+		t.Fatalf("chunkPathRe = %q", got)
+	}
+	if got := chunkPathRe.FindString(`e.u("static/chunks/4592.8f1c.js")`); got != "static/chunks/4592.8f1c.js" {
+		t.Fatalf("webpack chunkPathRe = %q", got)
+	}
+}
+
+const quotaActionID = "0123456789abcdef0123456789abcdef01234567"
+
+// turbopackSite reproduces the post-update deployment shape: chunks live under
+// /_next/static/immutable/chunks/, the action id sits two hops away from the
+// page HTML, and the previous deployment's id is answered with 409.
+func turbopackSite(t *testing.T) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/settings", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			if r.Header.Get("Next-Action") != quotaActionID {
+				w.Header().Set("Content-Type", "text/plain;charset=UTF-8")
+				w.WriteHeader(http.StatusConflict)
+				io.WriteString(w, "Server Action unavailable.")
+				return
+			}
+			w.Header().Set("Content-Type", "text/x-component")
+			io.WriteString(w, quotaFlightSample)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprintf(w, `<!DOCTYPE html><html><head>`+
+			`<script src="/_next/static/immutable/chunks/first.js" async=""></script>`+
+			`</head><body><script>self.__next_f.push([1,"\/_next\/static\/immutable\/chunks\/first.js"])</script></body></html>`)
+	})
+	mux.HandleFunc("/_next/static/immutable/chunks/first.js", func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `(globalThis.TURBOPACK=[]).push([1,e=>{e.u("static/immutable/chunks/second.js")}])`)
+	})
+	mux.HandleFunc("/_next/static/immutable/chunks/second.js", func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `let y=(0,g.createServerReference)("`+quotaActionID+
+			`",g.callServer,void 0,g.findSourceMapURL,"fetchSubscriptionAction")`)
+	})
+	return httptest.NewServer(mux)
+}
+
+func TestDiscoverQuotaActionTurbopackChunkGraph(t *testing.T) {
+	srv := turbopackSite(t)
+	defer srv.Close()
+	site, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	client := NewClientWithWSURL(site, srv.Client(), "")
+	id, err := client.discoverQuotaAction(context.Background(), map[string]string{"hatch_sess": "x"})
+	if err != nil {
+		t.Fatalf("discover: %v", err)
+	}
+	if id != quotaActionID {
+		t.Fatalf("action id = %q", id)
+	}
+}
+
+func TestQueryQuotaRediscoversRotatedAction(t *testing.T) {
+	srv := turbopackSite(t)
+	defer srv.Close()
+	site, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	client := NewClientWithWSURL(site, srv.Client(), "")
+	quota, err := client.QueryQuota(context.Background(), protocolCredentials())
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if quota.Plan != "Muse 免费版" || quota.WeeklyUsedPct != 16 {
+		t.Fatalf("unexpected quota: %+v", *quota)
+	}
+}
+
+func protocolCredentials() protocol.AccountCredentials {
+	return protocol.AccountCredentials{ID: "acc_1", Cookies: map[string]string{"hatch_sess": "x"}}
 }

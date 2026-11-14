@@ -32,10 +32,27 @@ const (
 	quotaBodyMaxBytes   = 4 << 20
 )
 
+// quotaPageCandidates are the authenticated surfaces that render the
+// subscription snapshot. The post-update build moved the pane between routes,
+// so discovery loads each page and scans the chunks they load. Server actions
+// are app-global: the id found on any of them can be posted to the primary
+// route.
+var quotaPageCandidates = []string{quotaPagePath, "/subscriptions"}
+
 var (
-	actionHexRe  = regexp.MustCompile(`[0-9a-f]{40,}`)
-	chunkURLRe   = regexp.MustCompile(`(/_next/static/chunks/[A-Za-z0-9_-]+\.js[^"'\s]*)`)
-	chunkNameRe  = regexp.MustCompile(`static/chunks/([A-Za-z0-9_-]+\.js)`)
+	actionHexRe = regexp.MustCompile(`[0-9a-f]{40,}`)
+	// Next.js changed its app-router asset layout with the Turbopack build:
+	// /_next/static/chunks/<name>.js is now
+	// /_next/static/immutable/chunks/<name>.js, and chunk names are hashes.
+	// Match both layouts and keep the whole path instead of a bare file name,
+	// because each layout resolves to a different URL.
+	scriptURLRe = regexp.MustCompile(`/_next/static/[^"'\s\\<>]+?\.js(?:\?[^"'\s\\<>]*)?`)
+	chunkPathRe = regexp.MustCompile(`static/(?:immutable/)?chunks/[^"'\s\\<>]+?\.js`)
+	// Server references are emitted as
+	// (0,g.createServerReference)("<id>",g.callServer,void 0,...,"<name>").
+	// The name is an argument, so read the call instead of scanning a fixed
+	// byte window around the name.
+	serverRefRe  = regexp.MustCompile(`createServerReference[^(]{0,40}\(([^)]{0,600})\)`)
 	dplRe        = regexp.MustCompile(`dpl_[A-Za-z0-9]+`)
 	loginMarkers = []string{"sign in", "log in", "login", "登录", "signin"}
 )
@@ -77,6 +94,9 @@ func (c *Client) QueryQuota(ctx context.Context, creds protocol.AccountCredentia
 	// the chunks the settings page loads and retry once.
 	discovered, discoverErr := c.discoverQuotaAction(ctx, creds.Cookies)
 	if discoverErr != nil {
+		if errors.Is(discoverErr, protocol.ErrSessionExpired) {
+			return nil, discoverErr
+		}
 		return nil, fmt.Errorf("额度接口定位失败：%v（首次原因：%v）", discoverErr, err)
 	}
 	subscription, err = c.callQuotaAction(ctx, creds.Cookies, discovered)
@@ -253,101 +273,153 @@ func looksLikeLoginPage(body []byte) bool {
 	return false
 }
 
-// discoverQuotaAction scans the deployed settings chunks for the server-action
-// reference. Pass one covers the first-screen scripts; the loader tables found
-// there name the lazily loaded chunks that pass two downloads.
+// discoverQuotaAction walks the authenticated pages' client chunk graphs until
+// it finds the server-action reference. A page only lists the chunks it needs
+// for the first render; the action id usually lives one or two hops deeper, so
+// chunk references are followed breadth-first.
 func (c *Client) discoverQuotaAction(ctx context.Context, cookies map[string]string) (string, error) {
 	base := strings.TrimRight(c.site.String(), "/")
-	html, err := c.fetchText(ctx, cookies, base+quotaPagePath, quotaBodyMaxBytes)
-	if err != nil {
-		return "", err
-	}
-	dpl := dplRe.FindString(html)
-
-	firstScreen := make(map[string]struct{})
-	for _, match := range chunkURLRe.FindAllStringSubmatch(html, -1) {
-		url := match[1]
-		if strings.HasPrefix(url, "/") {
-			url = base + url
+	queue := make([]string, 0, 64)
+	seen := make(map[string]bool)
+	dpl := ""
+	var lastErr error
+	for _, path := range quotaPageCandidates {
+		html, err := c.fetchText(ctx, cookies, base+path, quotaBodyMaxBytes)
+		if err != nil {
+			if errors.Is(err, protocol.ErrSessionExpired) {
+				return "", err
+			}
+			lastErr = err
+			continue
 		}
-		firstScreen[url] = struct{}{}
+		// RSC flight payloads embed asset URLs JSON-escaped (\/_next\/static\/...).
+		// Normalize them so both the document head and the stream are scanned.
+		html = strings.ReplaceAll(html, `\/`, "/")
+		html = strings.ReplaceAll(html, "&amp;", "&")
+		if dpl == "" {
+			dpl = dplRe.FindString(html)
+		}
+		// Some deployments inline the client reference into the flight payload
+		// instead of a separate chunk; try the page text first.
+		if id := actionIDFromChunk(html); id != "" {
+			return id, nil
+		}
+		for _, path := range scriptURLRe.FindAllString(html, -1) {
+			url := path
+			if !strings.HasPrefix(url, "http") {
+				url = base + url
+			}
+			if seen[url] {
+				continue
+			}
+			seen[url] = true
+			queue = append(queue, url)
+		}
 	}
-	if len(firstScreen) == 0 {
+	if len(queue) == 0 {
+		if lastErr != nil {
+			return "", lastErr
+		}
 		return "", errors.New("设置页没有引用任何脚本")
 	}
-	urls := make([]string, 0, len(firstScreen))
-	for url := range firstScreen {
-		urls = append(urls, url)
-	}
-
-	lazy := map[string]bool{}
-	if id := c.scanChunks(ctx, cookies, urls, lazy); id != "" {
-		return id, nil
-	}
-
-	lazyURLs := make([]string, 0, len(lazy))
-	for name := range lazy {
-		url := base + "/_next/static/chunks/" + name
-		if dpl != "" {
-			url += "?dpl=" + dpl
-		}
-		lazyURLs = append(lazyURLs, url)
-	}
-	if len(lazyURLs) > quotaScanLimit {
-		lazyURLs = lazyURLs[:quotaScanLimit]
-	}
-	if id := c.scanChunks(ctx, cookies, lazyURLs, nil); id != "" {
-		return id, nil
-	}
-	return "", errors.New("部署的脚本中没有找到额度接口标识")
+	return c.scanChunkGraph(ctx, cookies, base, dpl, queue, seen)
 }
 
-// scanChunks downloads chunks concurrently and returns the first action id.
-func (c *Client) scanChunks(ctx context.Context, cookies map[string]string, urls []string, lazy map[string]bool) string {
-	scanCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+// scanChunkGraph downloads chunks in small parallel batches and follows every
+// chunk reference they contain. Each batch is bounded, so cancelling a caller
+// waits at most one batch instead of every queued download.
+func (c *Client) scanChunkGraph(ctx context.Context, cookies map[string]string, base, dpl string, queue []string, seen map[string]bool) (string, error) {
+	scanned := 0
+	serverRefs := 0
+	var renamedID string
+	renamed := make(map[string]struct{})
+	refIDs := make(map[string]struct{})
 
-	var once sync.Once
-	var mu sync.Mutex
-	found := ""
-	sem := make(chan struct{}, quotaScanWorkers)
-	var wg sync.WaitGroup
-
-outer:
-	for _, url := range urls {
-		select {
-		case <-scanCtx.Done():
-			break outer
-		case sem <- struct{}{}:
+	for len(queue) > 0 && scanned < quotaScanLimit {
+		if err := ctx.Err(); err != nil {
+			return "", err
 		}
-		wg.Add(1)
-		go func(url string) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			text, err := c.fetchText(scanCtx, cookies, url, quotaChunkMaxBytes)
-			if err != nil {
-				return
-			}
-			if lazy != nil {
-				mu.Lock()
-				for _, match := range chunkNameRe.FindAllStringSubmatch(text, -1) {
-					lazy[match[1]] = true
+		batchSize := quotaScanWorkers
+		if len(queue) < batchSize {
+			batchSize = len(queue)
+		}
+		batch := queue[:batchSize]
+		queue = queue[batchSize:]
+
+		results := make(chan string, len(batch))
+		var wg sync.WaitGroup
+		for _, url := range batch {
+			wg.Add(1)
+			go func(url string) {
+				defer wg.Done()
+				text, err := c.fetchText(ctx, cookies, url, quotaChunkMaxBytes)
+				if err != nil {
+					return
 				}
-				mu.Unlock()
-			}
+				results <- text
+			}(url)
+		}
+		wg.Wait()
+		close(results)
+
+		for text := range results {
+			scanned++
 			if id := actionIDFromChunk(text); id != "" {
-				once.Do(func() {
-					found = id
-					cancel()
-				})
+				return id, nil
 			}
-		}(url)
+			// A renamed action still mentions "subscription" in its reference
+			// arguments. Keep it only when it is the single such reference.
+			if id := subscriptionActionFromChunk(text); id != "" {
+				renamed[id] = struct{}{}
+				renamedID = id
+			}
+			for _, call := range serverRefRe.FindAllStringSubmatch(text, -1) {
+				serverRefs++
+				if id := actionHexRe.FindString(call[1]); id != "" {
+					refIDs[id] = struct{}{}
+				}
+			}
+			for _, path := range chunkPathRe.FindAllString(text, -1) {
+				url := base + "/_next/" + path
+				if dpl != "" {
+					url += "?dpl=" + dpl
+				}
+				if seen[url] {
+					continue
+				}
+				seen[url] = true
+				queue = append(queue, url)
+			}
+		}
 	}
-	wg.Wait()
-	return found
+	if len(renamed) == 1 {
+		return renamedID, nil
+	}
+	// Last resort for builds that drop the reference name entirely: a single
+	// server action on the settings page can only be the quota fetch. The
+	// caller validates it by requiring a subscription payload.
+	if len(refIDs) == 1 {
+		for id := range refIDs {
+			return id, nil
+		}
+	}
+	return "", fmt.Errorf("部署的脚本中没有找到额度接口标识（已扫描 %d 个脚本，命中 %d 个 server action 引用）", scanned, serverRefs)
 }
 
+// actionIDFromChunk returns the id of the server reference whose argument list
+// names the quota action.
 func actionIDFromChunk(text string) string {
+	for _, call := range serverRefRe.FindAllStringSubmatch(text, -1) {
+		args := call[1]
+		if !strings.Contains(args, quotaActionName) {
+			continue
+		}
+		if id := actionHexRe.FindString(args); id != "" {
+			return id
+		}
+	}
+	// Fallback for builds that emit the call differently: the id still sits
+	// just before the action name.
 	idx := strings.Index(text, quotaActionName)
 	if idx < 0 {
 		return ""
@@ -360,9 +432,19 @@ func actionIDFromChunk(text string) string {
 	if end > len(text) {
 		end = len(text)
 	}
-	for _, candidate := range actionHexRe.FindAllString(text[start:end], -1) {
-		if len(candidate) >= 40 {
-			return candidate
+	return actionHexRe.FindString(text[start:end])
+}
+
+// subscriptionActionFromChunk finds a server reference whose arguments still
+// describe a subscription action after a rename, e.g. getSubscriptionAction.
+func subscriptionActionFromChunk(text string) string {
+	for _, call := range serverRefRe.FindAllStringSubmatch(text, -1) {
+		args := strings.ToLower(call[1])
+		if !strings.Contains(args, "subscription") && !strings.Contains(args, "quota") {
+			continue
+		}
+		if id := actionHexRe.FindString(call[1]); id != "" {
+			return id
 		}
 	}
 	return ""
@@ -381,6 +463,9 @@ func (c *Client) fetchText(ctx context.Context, cookies map[string]string, rawUR
 		return "", err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		return "", protocol.ErrSessionExpired
+	}
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
