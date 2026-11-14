@@ -292,23 +292,35 @@ func TestAccountCredentialsNeverReturned(t *testing.T) {
 
 type recordingDriver struct {
 	fakeDriver
-	imageAccount string
-	editAccount  string
-	editSize     string
-	imageRefs    []string
-	editRefs     []string
-	videoRefs    []string
-	session      *protocol.Session
+	imageAccount  string
+	imageExtra    string
+	imageDeadline time.Duration
+	editAccount   string
+	editSize      string
+	editExtra     string
+	editDeadline  time.Duration
+	imageRefs     []string
+	editRefs      []string
+	videoRefs     []string
+	session       *protocol.Session
 }
 
-func (d *recordingDriver) GenerateImage(_ context.Context, req protocol.ImageRequest) (*protocol.ImageResult, error) {
+func (d *recordingDriver) GenerateImage(ctx context.Context, req protocol.ImageRequest) (*protocol.ImageResult, error) {
 	d.imageAccount = req.AccountID
+	d.imageExtra = req.Extra
+	if deadline, ok := ctx.Deadline(); ok {
+		d.imageDeadline = time.Until(deadline)
+	}
 	d.imageRefs = append([]string(nil), req.ReferenceImages...)
 	return &protocol.ImageResult{Filename: "x.png", Kind: "image", URL: "/v1/media/x.png", Bytes: 1}, nil
 }
-func (d *recordingDriver) EditImage(_ context.Context, req protocol.ImageRequest) (*protocol.ImageResult, error) {
+func (d *recordingDriver) EditImage(ctx context.Context, req protocol.ImageRequest) (*protocol.ImageResult, error) {
 	d.editAccount = req.AccountID
 	d.editSize = req.Size
+	d.editExtra = req.Extra
+	if deadline, ok := ctx.Deadline(); ok {
+		d.editDeadline = time.Until(deadline)
+	}
 	d.editRefs = append([]string(nil), req.ReferenceImages...)
 	return &protocol.ImageResult{Filename: "x.png", Kind: "image", URL: "/v1/media/x.png", Bytes: 1}, nil
 }
@@ -372,6 +384,52 @@ func TestSyncImagesUseAccountLease(t *testing.T) {
 	rec = request(h, "POST", "/v1/images/edits", `{"prompt":"x","size":"1024x1024","image":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="}`, "test-secret")
 	if rec.Code != 200 || driver.editAccount != accountID || driver.editSize != "1024x1024" {
 		t.Fatalf("edit account=%q size=%q status=%d body=%s", driver.editAccount, driver.editSize, rec.Code, rec.Body.String())
+	}
+}
+
+func TestSyncImageForwardsExtraAndTimeout(t *testing.T) {
+	driver := &recordingDriver{}
+	_, h := testServer(t, driver)
+	rec := request(h, "POST", "/v1/images/generations", `{"prompt":"x","extra":"无文字","timeout":30}`, "test-secret")
+	if rec.Code != 200 {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if driver.imageExtra != "无文字" {
+		t.Fatalf("extra=%q", driver.imageExtra)
+	}
+	if driver.imageDeadline <= 20*time.Second || driver.imageDeadline > 30*time.Second {
+		t.Fatalf("deadline=%v, want about 30s", driver.imageDeadline)
+	}
+}
+
+func TestImageTimeoutValidation(t *testing.T) {
+	_, h := testServer(t, &fakeDriver{})
+	for _, body := range []string{`{"prompt":"x","timeout":-1}`, `{"prompt":"x","timeout":601}`} {
+		if rec := request(h, "POST", "/v1/images/generations", body, "test-secret"); rec.Code != 400 {
+			t.Fatalf("%s -> %d %s", body, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+func TestImageTaskPersistsExtraAndTimeout(t *testing.T) {
+	driver := &recordingDriver{}
+	s, h := testServer(t, driver)
+	rec := request(h, "POST", "/v1/images/tasks", `{"prompt":"x","extra":"无文字","timeout":45}`, "test-secret")
+	if rec.Code != 202 {
+		t.Fatalf("queue status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var queued struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &queued); err != nil || queued.ID == "" {
+		t.Fatalf("queue response %s", rec.Body.String())
+	}
+	task, err := s.store.GetTask(queued.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Extra != "无文字" || task.Timeout != 45 {
+		t.Fatalf("persisted extra=%q timeout=%d", task.Extra, task.Timeout)
 	}
 }
 
@@ -576,6 +634,12 @@ func TestImageEditsAcceptsMultipleMultipartImages(t *testing.T) {
 	if err := writer.WriteField("prompt", "combine"); err != nil {
 		t.Fatal(err)
 	}
+	if err := writer.WriteField("extra", "无文字"); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.WriteField("timeout", "25"); err != nil {
+		t.Fatal(err)
+	}
 	for i := 0; i < 2; i++ {
 		header := textproto.MIMEHeader{}
 		header.Set("Content-Disposition", fmt.Sprintf(`form-data; name="image"; filename="ref-%d.png"`, i))
@@ -599,6 +663,12 @@ func TestImageEditsAcceptsMultipleMultipartImages(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if rec.Code != 200 || len(driver.editRefs) != 2 {
 		t.Fatalf("status=%d refs=%d body=%s", rec.Code, len(driver.editRefs), rec.Body.String())
+	}
+	if driver.editExtra != "无文字" {
+		t.Fatalf("multipart extra=%q", driver.editExtra)
+	}
+	if driver.editDeadline <= 20*time.Second || driver.editDeadline > 25*time.Second {
+		t.Fatalf("multipart deadline=%v, want about 25s", driver.editDeadline)
 	}
 }
 

@@ -63,6 +63,11 @@ func BuildImagePrompt(request ImageRequest) string {
 	if hasReference {
 		parts = append(parts, "【纯净画面要求】：清除参考图中的文字、水印、签名、角标及 Logo，输出纯净无字画面")
 	}
+	// Extra is an explicit caller-supplied instruction. It goes last so the
+	// request-level constraint wins over the driver's own phrasing.
+	if extra := strings.TrimSpace(request.Extra); extra != "" {
+		parts = append(parts, extra)
+	}
 	return strings.Join(parts, "，")
 }
 

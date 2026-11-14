@@ -244,6 +244,13 @@ curl http://127.0.0.1:18610/v1/images/generations \
 
 `/v1/images/edits` 的 multipart 请求可以重复提交同名的 `image` 字段。
 
+图片请求还支持两个可选字段：
+
+- `extra`：追加到上游提示词末尾的额外约束，适合放"不要出现文字"这类硬要求。图片端点没有 `resolution` 字段，传了会被静默忽略。
+- `timeout`：本次生成的超时秒数，`0` 或省略使用 `MUSE2API_IMAGE_TIMEOUT`（默认 240），最大 600；同步、异步任务和 `/v1/images/edits` 的 multipart 都生效。
+
+`size` 与 `aspect_ratio` 都只是写进提示词的比例提示，不保证精确出图尺寸；响应里的 `size` 是请求值。
+
 ### 视频
 
 `POST /v1/videos` 建任务，`GET /v1/videos/{id}` 查。`/v1/videos/generations` 是兼容路径，行为一样。

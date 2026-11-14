@@ -421,6 +421,9 @@ func validateImage(req *imageAPIRequest) error {
 	if req.N > 1 {
 		return apierr.New(400, "capability_unavailable", "上游单任务多图能力未验证")
 	}
+	if req.Timeout < 0 || req.Timeout > maxImageTimeoutSeconds {
+		return apierr.BadRequest("timeout 需为 0（默认）或 1-600 秒")
+	}
 	if req.ResponseFormat == "" {
 		req.ResponseFormat = "url"
 	}
@@ -430,11 +433,41 @@ func validateImage(req *imageAPIRequest) error {
 	return nil
 }
 
+// maxImageTimeoutSeconds is the same ceiling czg86389-hub/muse2api exposes.
+// A request may shorten or extend the default generation window, but never
+// beyond ten minutes.
+const maxImageTimeoutSeconds = 600
+
+func (s *Server) imageRequestTimeout(req imageAPIRequest) time.Duration {
+	if req.Timeout <= 0 {
+		return s.cfg.ImageTimeout
+	}
+	seconds := req.Timeout
+	if seconds > maxImageTimeoutSeconds {
+		seconds = maxImageTimeoutSeconds
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+// imageTaskContext applies the same request-level timeout to queued image
+// tasks. The task's own context still wins when its deadline is earlier.
+func (s *Server) imageTaskContext(ctx context.Context, t model.Task) (context.Context, context.CancelFunc) {
+	timeout := s.cfg.ImageTimeout
+	if t.Timeout > 0 {
+		seconds := t.Timeout
+		if seconds > maxImageTimeoutSeconds {
+			seconds = maxImageTimeoutSeconds
+		}
+		timeout = time.Duration(seconds) * time.Second
+	}
+	return context.WithTimeout(ctx, timeout)
+}
+
 // generateImageSync is the shared lease/driver/response path for synchronous
 // generation and editing. Both endpoints must keep identical timeout, account
 // selection, and error mapping behavior.
 func (s *Server) generateImageSync(w http.ResponseWriter, r *http.Request, req imageAPIRequest, edit bool) {
-	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.ImageTimeout)
+	ctx, cancel := context.WithTimeout(r.Context(), s.imageRequestTimeout(req))
 	defer cancel()
 	lease, err := s.pool.AcquireFor(ctx, scheduler.ClassImage)
 	if err != nil {
@@ -445,7 +478,7 @@ func (s *Server) generateImageSync(w http.ResponseWriter, r *http.Request, req i
 	defer s.pool.Wake()
 	request := protocol.ImageRequest{
 		Prompt: req.Prompt, Model: resolveModel(req.Model, "muse-image"),
-		Size: req.Size, AspectRatio: req.AspectRatio,
+		Size: req.Size, AspectRatio: req.AspectRatio, Extra: req.Extra,
 		ReferenceImage: req.reference(), ReferenceImages: req.ReferenceImages,
 		ResponseFormat: req.ResponseFormat, AccountID: lease.Account.ID,
 	}
@@ -511,6 +544,15 @@ func (s *Server) imageEdits(w http.ResponseWriter, r *http.Request) {
 		req.Size = r.FormValue("size")
 		req.AspectRatio = r.FormValue("aspect_ratio")
 		req.ResponseFormat = r.FormValue("response_format")
+		req.Extra = r.FormValue("extra")
+		if rawTimeout := strings.TrimSpace(r.FormValue("timeout")); rawTimeout != "" {
+			seconds, err := strconv.Atoi(rawTimeout)
+			if err != nil {
+				apierr.Write(w, r, apierr.BadRequest("timeout 必须为整数秒"))
+				return
+			}
+			req.Timeout = seconds
+		}
 		req.Async = r.FormValue("async") == "true" || r.FormValue("async") == "1"
 		var err error
 		rawRefs, err = s.multipartReferences(r)
@@ -596,6 +638,7 @@ func (s *Server) queueImage(w http.ResponseWriter, r *http.Request, req imageAPI
 	taskRecord, created, err := s.store.FindOrCreateTask(model.Task{
 		Kind: "image", Prompt: req.Prompt, APIPrompt: req.Prompt,
 		Model: resolveModel(req.Model, "muse-image"), Size: req.Size, AspectRatio: req.AspectRatio,
+		Extra: req.Extra, Timeout: req.Timeout,
 		ReferenceImage: req.reference(), ReferenceImages: req.ReferenceImages, ResponseFormat: req.ResponseFormat,
 		IdempotencyKey: keyHash, RequestHash: hash,
 	})

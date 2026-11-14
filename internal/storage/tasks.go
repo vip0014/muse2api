@@ -70,12 +70,12 @@ func insertTaskTx(tx *sql.Tx, t model.Task) error {
 	_, err = tx.Exec(`INSERT INTO tasks(id, object, kind, prompt, api_prompt, status, progress, account_id,
 created_at, updated_at, started_at, completed_at, elapsed, error, result_json, url, size, model,
 aspect_ratio, resolution, duration, response_format, idempotency_key, request_hash, cancel_requested,
-reference_image, reference_images_json)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+reference_image, reference_images_json, extra, timeout)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		t.ID, t.Object, t.Kind, t.Prompt, t.APIPrompt, string(t.Status), t.Progress, t.AccountID,
 		t.CreatedAt, t.UpdatedAt, t.StartedAt, t.CompletedAt, t.Elapsed, t.Error, result, t.URL, t.Size, t.Model,
 		t.AspectRatio, t.Resolution, t.Duration, t.ResponseFormat, t.IdempotencyKey, t.RequestHash, boolInt(t.CancelRequested),
-		t.ReferenceImage, references)
+		t.ReferenceImage, references, t.Extra, t.Timeout)
 	return err
 }
 
@@ -146,7 +146,7 @@ func (s *Store) ListTasks(limit int) []model.Task {
 	query := `SELECT id, object, kind, prompt, api_prompt, status, progress, account_id,
 created_at, updated_at, started_at, completed_at, elapsed, error, result_json, url, size, model,
 aspect_ratio, resolution, duration, response_format, idempotency_key, request_hash, cancel_requested,
-'' AS reference_image, '' AS reference_images_json
+'' AS reference_image, '' AS reference_images_json, '' AS extra, 0 AS timeout
 FROM tasks ORDER BY created_at DESC, id DESC`
 	args := []any{}
 	if limit > 0 {
@@ -329,7 +329,7 @@ func getTaskTx(q interface {
 }, id string) (model.Task, error) {
 	row := q.QueryRow(`SELECT id, object, kind, prompt, api_prompt, status, progress, account_id,
 created_at, updated_at, started_at, completed_at, elapsed, error, result_json, url, size, model,
-aspect_ratio, resolution, duration, response_format, idempotency_key, request_hash, cancel_requested, reference_image, reference_images_json
+aspect_ratio, resolution, duration, response_format, idempotency_key, request_hash, cancel_requested, reference_image, reference_images_json, extra, timeout
 FROM tasks WHERE id = ?`, id)
 	t, err := scanTask(row)
 	if err != nil {
@@ -344,7 +344,7 @@ FROM tasks WHERE id = ?`, id)
 func getTaskByKeyTx(tx *sql.Tx, kind, key string) (model.Task, error) {
 	row := tx.QueryRow(`SELECT id, object, kind, prompt, api_prompt, status, progress, account_id,
 created_at, updated_at, started_at, completed_at, elapsed, error, result_json, url, size, model,
-aspect_ratio, resolution, duration, response_format, idempotency_key, request_hash, cancel_requested, reference_image, reference_images_json
+aspect_ratio, resolution, duration, response_format, idempotency_key, request_hash, cancel_requested, reference_image, reference_images_json, extra, timeout
 FROM tasks WHERE kind = ? AND idempotency_key = ?`, kind, key)
 	t, err := scanTask(row)
 	if err != nil {
@@ -368,11 +368,11 @@ func updateTaskTx(tx *sql.Tx, t model.Task) error {
 	_, err = tx.Exec(`UPDATE tasks SET object = ?, status = ?, progress = ?, account_id = ?, created_at = ?,
 updated_at = ?, started_at = ?, completed_at = ?, elapsed = ?, error = ?, result_json = ?, url = ?, size = ?,
 model = ?, aspect_ratio = ?, resolution = ?, duration = ?, response_format = ?, idempotency_key = ?,
-request_hash = ?, cancel_requested = ?, reference_image = ?, reference_images_json = ? WHERE id = ?`,
+request_hash = ?, cancel_requested = ?, reference_image = ?, reference_images_json = ?, extra = ?, timeout = ? WHERE id = ?`,
 		t.Object, string(t.Status), t.Progress, t.AccountID, t.CreatedAt, t.UpdatedAt, t.StartedAt,
 		t.CompletedAt, t.Elapsed, t.Error, result, t.URL, t.Size, t.Model, t.AspectRatio,
 		t.Resolution, t.Duration, t.ResponseFormat, t.IdempotencyKey, t.RequestHash,
-		boolInt(t.CancelRequested), t.ReferenceImage, references, t.ID)
+		boolInt(t.CancelRequested), t.ReferenceImage, references, t.Extra, t.Timeout, t.ID)
 	return err
 }
 
@@ -384,7 +384,7 @@ func scanTask(row rowScanner) (model.Task, error) {
 		&t.AccountID, &t.CreatedAt, &t.UpdatedAt, &t.StartedAt, &t.CompletedAt, &t.Elapsed, &t.Error,
 		&result, &t.URL, &t.Size, &t.Model, &t.AspectRatio, &t.Resolution, &t.Duration,
 		&t.ResponseFormat, &t.IdempotencyKey, &t.RequestHash, &cancel,
-		&t.ReferenceImage, &references); err != nil {
+		&t.ReferenceImage, &references, &t.Extra, &t.Timeout); err != nil {
 		return model.Task{}, err
 	}
 	t.Status = model.TaskStatus(status)

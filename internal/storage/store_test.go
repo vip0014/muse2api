@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -52,6 +53,64 @@ func TestEncryptedAccountRoundTrip(t *testing.T) {
 	}
 	_ = base64.StdEncoding
 }
+func TestTaskSchemaAddsExtraAndTimeout(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sql.Open("sqlite", filepath.Join(dir, "muse2api.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Mirror the pre-extra task schema so the migration path is exercised,
+	// not just a fresh CREATE TABLE.
+	if _, err := db.Exec(`CREATE TABLE tasks (
+  id TEXT PRIMARY KEY, object TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL,
+  prompt TEXT NOT NULL, api_prompt TEXT NOT NULL, status TEXT NOT NULL,
+  progress INTEGER NOT NULL DEFAULT 0, account_id TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+  started_at INTEGER NOT NULL DEFAULT 0, completed_at INTEGER NOT NULL DEFAULT 0,
+  elapsed REAL NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '',
+  result_json TEXT NOT NULL DEFAULT '', url TEXT NOT NULL DEFAULT '',
+  size TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '',
+  aspect_ratio TEXT NOT NULL DEFAULT '', resolution TEXT NOT NULL DEFAULT '',
+  duration INTEGER NOT NULL DEFAULT 0, response_format TEXT NOT NULL DEFAULT '',
+  idempotency_key TEXT NOT NULL DEFAULT '', request_hash TEXT NOT NULL DEFAULT '',
+  cancel_requested INTEGER NOT NULL DEFAULT 0,
+  reference_image TEXT NOT NULL DEFAULT '',
+  reference_images_json TEXT NOT NULL DEFAULT ''
+)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO tasks(id, kind, prompt, api_prompt, status, created_at, updated_at)
+VALUES ('old', 'image', 'p', 'p', 'queued', 1, 1)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := openTest(t, dir, testKey(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetTask("old")
+	if err != nil {
+		t.Fatalf("legacy task unreadable after migration: %v", err)
+	}
+	if got.Extra != "" || got.Timeout != 0 {
+		t.Fatalf("migrated defaults extra=%q timeout=%d", got.Extra, got.Timeout)
+	}
+	if _, err := s.UpdateTask("old", func(task *model.Task) error {
+		task.Extra = "e"
+		task.Timeout = 30
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.GetTask("old")
+	if err != nil || got.Extra != "e" || got.Timeout != 30 {
+		t.Fatalf("round trip extra=%q timeout=%d err=%v", got.Extra, got.Timeout, err)
+	}
+}
+
 func TestLegacyMigrationBacksUpAndIsIdempotent(t *testing.T) {
 	dir := t.TempDir()
 	legacy := `[{"id":"old","label":"old","cookies":{"hatch_sess":"s"},"created_at":1}]`

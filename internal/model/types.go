@@ -102,6 +102,8 @@ type Task struct {
 	Duration        int            `json:"duration,omitempty"`
 	ReferenceImage  string         `json:"-"`
 	ReferenceImages []string       `json:"-"`
+	Extra           string         `json:"-"`
+	Timeout         int            `json:"-"`
 	ResponseFormat  string         `json:"response_format,omitempty"`
 	IdempotencyKey  string         `json:"image_request_key,omitempty"`
 	RequestHash     string         `json:"image_request_hash,omitempty"`

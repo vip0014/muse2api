@@ -195,7 +195,9 @@ CREATE TABLE IF NOT EXISTS tasks (
   request_hash TEXT NOT NULL DEFAULT '',
   cancel_requested INTEGER NOT NULL DEFAULT 0,
   reference_image TEXT NOT NULL DEFAULT '',
-  reference_images_json TEXT NOT NULL DEFAULT ''
+  reference_images_json TEXT NOT NULL DEFAULT '',
+  extra TEXT NOT NULL DEFAULT '',
+  timeout INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_idempotency
   ON tasks(kind, idempotency_key) WHERE idempotency_key <> '';
@@ -253,6 +255,8 @@ CREATE INDEX IF NOT EXISTS idx_media_created ON media(created_at DESC);
 	for _, column := range []struct{ name, ddl string }{
 		{"reference_image", `ALTER TABLE tasks ADD COLUMN reference_image TEXT NOT NULL DEFAULT ''`},
 		{"reference_images_json", `ALTER TABLE tasks ADD COLUMN reference_images_json TEXT NOT NULL DEFAULT ''`},
+		{"extra", `ALTER TABLE tasks ADD COLUMN extra TEXT NOT NULL DEFAULT ''`},
+		{"timeout", `ALTER TABLE tasks ADD COLUMN timeout INTEGER NOT NULL DEFAULT 0`},
 	} {
 		var count int
 		if err := s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = ?`, column.name).Scan(&count); err != nil {

@@ -38,6 +38,7 @@ type ChatEvent struct {
 }
 type ImageRequest struct {
 	Prompt, Model, Size, AspectRatio, ResponseFormat, ReferenceImage, AccountID string
+	Extra                                                                       string
 	ReferenceImages                                                             []string
 }
 type ImageResult struct {

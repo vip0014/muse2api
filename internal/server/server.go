@@ -524,7 +524,9 @@ func (s *Server) processTask(ctx context.Context, t model.Task) (task.Result, er
 	}
 	switch t.Kind {
 	case "image":
-		res, err := s.driver.GenerateImage(ctx, protocol.ImageRequest{Prompt: t.APIPrompt, Model: t.Model, Size: t.Size, AspectRatio: t.AspectRatio, ResponseFormat: t.ResponseFormat, ReferenceImage: t.ReferenceImage, ReferenceImages: t.ReferenceImages, AccountID: lease.Account.ID})
+		imageCtx, cancel := s.imageTaskContext(ctx, t)
+		defer cancel()
+		res, err := s.driver.GenerateImage(imageCtx, protocol.ImageRequest{Prompt: t.APIPrompt, Model: t.Model, Size: t.Size, AspectRatio: t.AspectRatio, Extra: t.Extra, ResponseFormat: t.ResponseFormat, ReferenceImage: t.ReferenceImage, ReferenceImages: t.ReferenceImages, AccountID: lease.Account.ID})
 		if err != nil {
 			return task.Result{}, err
 		}
