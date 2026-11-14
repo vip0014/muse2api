@@ -22,9 +22,19 @@ import (
 )
 
 const (
-	textSettle      = 2 * time.Second
-	mediaSettle     = 4 * time.Second
-	noMediaSettle   = 15 * time.Second
+	textSettle  = 2 * time.Second
+	mediaSettle = 4 * time.Second
+	// noMediaSettle is the grace period after the assistant's last text
+	// before a media turn is reported as a refusal. Ending a turn as soon as
+	// the model stops talking is wrong for agent runs: with an image
+	// attachment the upstream model routinely acknowledges first ("I'll use
+	// the image you just uploaded as the first frame") and only then starts
+	// the generation tool, which can take tens of seconds. The 15s value used
+	// to cut those turns mid-generation and surfaced as "模型未生成媒体" even
+	// though the model never refused. Keep this above the expected tool
+	// start-up window; the per-request timeout still bounds the total wait,
+	// and explicit refusal markers below still fail immediately.
+	noMediaSettle   = 2 * time.Minute
 	pollInterval    = 500 * time.Millisecond
 	chromeUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"
 )
